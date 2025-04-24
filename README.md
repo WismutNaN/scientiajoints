@@ -47,17 +47,18 @@ ScientiaJoints is a Blender add-on (compatible with Blender 4.2+) developed by S
 ## Our Products
 
 - **Magicore**  
-  Service for automatic geomechanical core documentation generation from photos. [More](https://scientia.ru)
+  Service for automatic geomechanical core documentation generation from photos. [More](https://weare.science)
 - **Digger**  
-  Pit wall optimization software using 3D modeling. [More](https://scientia.ru)
+  Pit wall optimization software using 3D modeling. [More](https://weare.science)
 - **Prorock 2.0**  
-  Geomechanics solution for fracture and dynamic process modeling. [More](https://scientia.ru)
+  Geomechanics solution for fracture and dynamic process modeling. [More](https://weare.science)
 - **NUR Extensometer**  
-  Instrument for automated monitoring of cracks and fissures. [More](https://scientia.ru)
+  Instrument for automated monitoring of cracks and fissures. [More](https://weare.science)
 - **Joint Explorer™**  
-  Electronic geological compass for measuring azimuth and dip of structural elements. [More](https://scientia.ru)
+  Electronic geological compass for measuring azimuth and dip of structural elements. [More](https://weare.science)
 
-Visit our website [scientia.ru](https://scientia.ru) for full product listings and documentation.
+Visit our website [weare.science](https://weare.science) for full product listings and documentation.
+Follow us on LinkedIn: [WeAreScience](https://www.linkedin.com/company/wearescience/).
 
 ## Contributing
 
