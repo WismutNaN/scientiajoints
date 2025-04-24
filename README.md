@@ -62,7 +62,3 @@ Visit our website [scientia.ru](https://scientia.ru) for full product listings a
 ## Contributing
 
 Feedback, bug reports, and pull requests are welcome! Please open issues and submit PRs in this repository.
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
