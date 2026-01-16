@@ -6,6 +6,227 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================
+# Helpers: safe attribute access (compat between Blender versions)
+# ============================================================
+
+def _get_first_attr(obj, names, default=None):
+    for n in names:
+        try:
+            if hasattr(obj, n):
+                return getattr(obj, n)
+        except Exception:
+            continue
+    return default
+
+
+def _set_first_attr(obj, names, value):
+    for n in names:
+        try:
+            if hasattr(obj, n):
+                setattr(obj, n, value)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+# ============================================================
+# Helpers: Annotations / Measure layer discovery (Blender 5.0+)
+# ============================================================
+
+def _iter_annotation_datablocks():
+    # Blender 5.0+: bpy.data.annotations (renamed); older: bpy.data.grease_pencils
+    if hasattr(bpy.data, "annotations"):
+        try:
+            for ann in bpy.data.annotations:
+                yield ann
+        except Exception:
+            pass
+
+    if hasattr(bpy.data, "grease_pencils"):
+        try:
+            for gp in bpy.data.grease_pencils:
+                yield gp
+        except Exception:
+            pass
+
+    # Scene-linked fallback
+    try:
+        scene = bpy.context.scene
+        if scene:
+            for attr in ("annotation", "annotations", "grease_pencil"):
+                if hasattr(scene, attr):
+                    v = getattr(scene, attr)
+                    if v:
+                        yield v
+    except Exception:
+        pass
+
+
+def _find_ruler_layer(layer_name="RulerData3D"):
+    for db in _iter_annotation_datablocks():
+        layers = getattr(db, "layers", None)
+        if not layers:
+            continue
+
+        try:
+            if hasattr(layers, "get"):
+                ly = layers.get(layer_name)
+                if ly:
+                    return db, ly
+        except Exception:
+            pass
+
+        try:
+            ly = layers[layer_name]
+            if ly:
+                return db, ly
+        except Exception:
+            pass
+
+        try:
+            for ly in layers:
+                lname = getattr(ly, "info", None) or getattr(ly, "name", None) or ""
+                if str(lname) == layer_name or str(lname).startswith(layer_name):
+                    return db, ly
+        except Exception:
+            pass
+
+    return None, None
+
+
+# ============================================================
+# Helpers: World background node
+# ============================================================
+
+def _ensure_world(scene: bpy.types.Scene) -> bpy.types.World:
+    if scene.world is None:
+        scene.world = bpy.data.worlds.new("World")
+    world = scene.world
+    if not world.use_nodes:
+        world.use_nodes = True
+    if world.node_tree is None:
+        world.use_nodes = True
+    return world
+
+
+def _get_or_create_world_bg_node(world: bpy.types.World):
+    """
+    Returns (bg_node, out_node). Ensures nodes and link exist.
+    """
+    nt = world.node_tree
+    nodes = nt.nodes
+    links = nt.links
+
+    # Output
+    out_node = next((n for n in nodes if n.type == "OUTPUT_WORLD"), None)
+    if out_node is None:
+        out_node = nodes.new("ShaderNodeOutputWorld")
+        out_node.location = (400, 0)
+
+    # Background
+    bg_node = nodes.get("Background")
+    if bg_node is None:
+        bg_node = next((n for n in nodes if n.type == "BACKGROUND"), None)
+    if bg_node is None:
+        bg_node = nodes.new("ShaderNodeBackground")
+        bg_node.location = (0, 0)
+        bg_node.name = "Background"
+        bg_node.label = "Background"
+
+    # Ensure link: Background -> World Output (Surface)
+    bg_out = bg_node.outputs.get("Background")
+    out_in = out_node.inputs.get("Surface")
+    if bg_out and out_in and not out_in.is_linked:
+        links.new(bg_out, out_in)
+
+    return bg_node, out_node
+
+
+# ============================================================
+# Helpers: Material + Principled
+# ============================================================
+
+def _get_or_create_principled_material(mat_name: str):
+    """
+    Ensures:
+      - material exists
+      - use_nodes = True
+      - has Principled BSDF + Material Output
+      - Principled is connected to Output Surface if not linked
+    Returns (material, principled_node)
+    """
+    mat = bpy.data.materials.get(mat_name)
+    if mat is None:
+        mat = bpy.data.materials.new(name=mat_name)
+
+    if not mat.use_nodes:
+        mat.use_nodes = True
+
+    nt = mat.node_tree
+    if nt is None:
+        mat.use_nodes = True
+        nt = mat.node_tree
+
+    nodes = nt.nodes
+    links = nt.links
+
+    out = next((n for n in nodes if n.type == "OUTPUT_MATERIAL"), None)
+    if out is None:
+        out = nodes.new("ShaderNodeOutputMaterial")
+        out.location = (400, 0)
+
+    principled = next((n for n in nodes if n.type == "BSDF_PRINCIPLED"), None)
+    if principled is None:
+        principled = nodes.new("ShaderNodeBsdfPrincipled")
+        principled.location = (0, 0)
+
+    surf = out.inputs.get("Surface")
+    bsdf = principled.outputs.get("BSDF")
+    if surf and bsdf and not surf.is_linked:
+        links.new(bsdf, surf)
+
+    return mat, principled
+
+
+def _get_principled_inputs(material_or_node):
+    """
+    Accepts either a Material or a Principled node.
+    Returns: (metallic_input, roughness_input, specular_input)
+    """
+    principled = None
+
+    # If Material passed, find Principled in its node tree
+    if isinstance(material_or_node, bpy.types.Material):
+        mat = material_or_node
+        if (mat is None) or (not getattr(mat, "use_nodes", False)) or (mat.node_tree is None):
+            return None, None, None
+        principled = next((n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+    else:
+        principled = material_or_node
+
+    if (principled is None) or (not hasattr(principled, "inputs")):
+        return None, None, None
+
+    metallic_input = principled.inputs.get("Metallic")
+    roughness_input = principled.inputs.get("Roughness")
+
+    # Name may vary across versions / node definitions
+    specular_input = (
+        principled.inputs.get("Specular IOR Level") or
+        principled.inputs.get("Specular") or
+        principled.inputs.get("Specular IOR")
+    )
+
+    return metallic_input, roughness_input, specular_input
+
+
+# ============================================================
+# Export operators
+# ============================================================
+
 class ExportRawEdgesOperator(Operator):
     bl_idname = "export.raw_edges"
     bl_label = "Raw Edges"
@@ -54,8 +275,14 @@ class ExportProcessedEdgesOperator(Operator):
             az_real = context.scene.az_real
             az_model = context.scene.az_model
             parser.process_edges(az_real=az_real, az_model=az_model)
-            # Update visualization
-            context.area.tag_redraw()
+
+            # Update visualization (safe)
+            try:
+                if context.area and hasattr(context.area, "tag_redraw"):
+                    context.area.tag_redraw()
+            except Exception:
+                pass
+
             self.report({'INFO'}, "Processed edges exported successfully.")
             logger.info("Edges processed.")
         except Exception as e:
@@ -76,8 +303,14 @@ class ExportProcessedFacesOperator(Operator):
             az_real = context.scene.az_real
             az_model = context.scene.az_model
             parser.process_faces(az_real=az_real, az_model=az_model)
-            # Update visualization
-            context.area.tag_redraw()
+
+            # Update visualization (safe)
+            try:
+                if context.area and hasattr(context.area, "tag_redraw"):
+                    context.area.tag_redraw()
+            except Exception:
+                pass
+
             self.report({'INFO'}, "Processed faces exported successfully.")
             logger.info("Faces processed.")
         except Exception as e:
@@ -86,10 +319,15 @@ class ExportProcessedFacesOperator(Operator):
         return {'FINISHED'}
 
 
+# ============================================================
+# Visualization operators
+# ============================================================
+
 class ShowHistogramImageOperator(bpy.types.Operator):
     bl_idname = "wm.show_histogram_image"
     bl_label = "Open Histogram"
     bl_description = "Display of the histogram of the distribution of linear measurements in the model"
+
     def execute(self, context):
         try:
             update_histogram_image(context)
@@ -118,7 +356,9 @@ class ShowStereonetImageOperator(bpy.types.Operator):
 class RealTimeHistogramUpdateOperator(bpy.types.Operator):
     bl_idname = "wm.real_time_histogram_update_operator"
     bl_label = "Real-Time Histogram Update Operator"
-    bl_description = "Automatic chart update at a specified frequency. The frequency can be changed in the visualization settings, but only when the automatic update function is disabled."
+    bl_description = ("Automatic chart update at a specified frequency. "
+                      "The frequency can be changed in the visualization settings, "
+                      "but only when the automatic update function is disabled.")
 
     _timer = None
     _running = False
@@ -168,7 +408,9 @@ class RealTimeHistogramUpdateOperator(bpy.types.Operator):
 class RealTimeStereonetUpdateOperator(bpy.types.Operator):
     bl_idname = "wm.real_time_stereonet_update_operator"
     bl_label = "Real-Time Stereonet Update Operator"
-    bl_description = "Automatic chart update at a specified frequency. The frequency can be changed in the visualization settings, but only when the automatic update function is disabled."
+    bl_description = ("Automatic chart update at a specified frequency. "
+                      "The frequency can be changed in the visualization settings, "
+                      "but only when the automatic update function is disabled.")
 
     _timer = None
     _running = False
@@ -215,149 +457,9 @@ class RealTimeStereonetUpdateOperator(bpy.types.Operator):
         return {'CANCELLED'}
 
 
-
-
-# class ToggleLightSettingsOperator(bpy.types.Operator):
-#     bl_idname = "wm.toggle_light_settings"
-#     bl_label = "Toggle Light Settings"
-#     bl_description = "Toggle between custom light settings and default settings"
-    
-#     is_custom_settings = bpy.props.BoolProperty(default=False)
-#     saved_settings = None  # Инициализация как None
-
-#     def execute(self, context):
-#         scene = context.scene
-#         world = scene.world
-#         material = bpy.data.materials.get("material0")
-
-#         if not material:
-#             self.report({'ERROR'}, "Material 'material0' not found")
-#             return {'CANCELLED'}
-
-#         if not material.use_nodes:
-#             self.report({'ERROR'}, "Material 'material0' does not use nodes")
-#             return {'CANCELLED'}
-
-#         nodes = material.node_tree.nodes
-#         principled_bsdf = None
-#         for node in nodes:
-#             if node.type == 'BSDF_PRINCIPLED':
-#                 principled_bsdf = node
-#                 break
-
-#         if not principled_bsdf:
-#             self.report({'ERROR'}, "Principled BSDF node not found in 'material0'")
-#             return {'CANCELLED'}
-
-#         metallic_input = principled_bsdf.inputs.get("Metallic")
-#         roughness_input = principled_bsdf.inputs.get("Roughness")
-#         specular_ior_input = principled_bsdf.inputs.get("Specular IOR Level")
-
-#         if not (metallic_input and roughness_input and specular_ior_input):
-#             self.report({'ERROR'}, "One or more required inputs not found in Principled BSDF")
-#             return {'CANCELLED'}
-
-#         # Если это первый вызов, сохраняем начальные настройки
-#         if self.saved_settings is None:
-#             # Сохранение начальных настроек
-#             self.saved_settings = {
-#                 "engine": scene.render.engine,
-#                 "samples": scene.eevee.taa_samples,
-#                 "raytracing": scene.eevee.use_gtao,
-#                 "film_transparent": scene.render.film_transparent,
-#                 "world_color": world.node_tree.nodes["Background"].inputs[0].default_value[:],
-#                 "world_strength": world.node_tree.nodes["Background"].inputs[1].default_value,
-#                 "material_metallic": metallic_input.default_value,
-#                 "material_roughness": roughness_input.default_value,
-#                 "material_specular_ior": specular_ior_input.default_value
-#             }
-
-#             # Установка кастомных настроек
-#             scene.render.engine = 'BLENDER_EEVEE_NEXT'
-#             scene.eevee.taa_samples = 64
-#             scene.eevee.use_gtao = True
-#             scene.render.film_transparent = True
-
-#             world.node_tree.nodes["Background"].inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)  # Белый цвет
-#             world.node_tree.nodes["Background"].inputs[1].default_value = 0.5  # Strength
-
-#             metallic_input.default_value = 0.0
-#             roughness_input.default_value = 1.0
-#             specular_ior_input.default_value = 0.0
-
-#         else:
-#             # Восстановление исходных настроек
-#             if "engine" in self.saved_settings:
-#                 scene.render.engine = self.saved_settings["engine"]
-#                 scene.eevee.taa_samples = self.saved_settings["samples"]
-#                 scene.eevee.use_gtao = self.saved_settings["raytracing"]
-#                 scene.render.film_transparent = self.saved_settings["film_transparent"]
-
-#                 world.node_tree.nodes["Background"].inputs[0].default_value = self.saved_settings["world_color"]
-#                 world.node_tree.nodes["Background"].inputs[1].default_value = self.saved_settings["world_strength"]
-
-#                 metallic_input.default_value = self.saved_settings["material_metallic"]
-#                 roughness_input.default_value = self.saved_settings["material_roughness"]
-#                 specular_ior_input.default_value = self.saved_settings["material_specular_ior"]
-
-#             # Очищаем настройки после восстановления
-#             self.saved_settings = None
-
-#         self.is_custom_settings = not self.is_custom_settings
-
-#         return {'FINISHED'}
-
-
-
-# class ToggleRulerSettingsOperator(bpy.types.Operator):
-#     bl_idname = "wm.toggle_ruler_settings"
-#     bl_label = "Toggle Ruler Settings"
-#     bl_description = "Toggle between custom ruler settings and default settings"
-
-#     is_custom_ruler_settings = bpy.props.BoolProperty(default=False)
-#     saved_ruler_settings = None  # Инициализация как None
-
-#     def execute(self, context):
-#         scene = context.scene
-#         ruler_layer = None
-
-#         for annotation in scene.grease_pencil.layers:
-#             if annotation.info == "RulerData3D":
-#                 ruler_layer = annotation
-#                 break
-
-#         if not ruler_layer:
-#             self.report({'ERROR'}, "RulerData3D layer not found in Annotations")
-#             return {'CANCELLED'}
-
-#         ruler_layer.hide = False  # Включаем слой
-
-#         # Если это первый вызов и saved_ruler_settings еще не существует
-#         if self.saved_ruler_settings is None:
-#             self.saved_ruler_settings = {
-#                 "color": ruler_layer.color[:],
-#                 "opacity": ruler_layer.opacity,
-#                 "thickness": int(ruler_layer.thickness)
-#             }
-
-#             # Установка новых значений
-#             ruler_layer.color = (1.0, 0.0, 0.0)  # Красный цвет (только 3 значения)
-#             ruler_layer.opacity = 0.7  # Непрозрачность
-#             ruler_layer.thickness = 7  # Толщина как int
-
-#         else:
-#             # Восстановление исходных настроек
-#             ruler_layer.color = self.saved_ruler_settings["color"]
-#             ruler_layer.opacity = self.saved_ruler_settings["opacity"]
-#             ruler_layer.thickness = self.saved_ruler_settings["thickness"]
-
-#             # Удаление сохраненных настроек
-#             self.saved_ruler_settings = None
-
-#         self.is_custom_ruler_settings = not self.is_custom_ruler_settings
-
-#         return {'FINISHED'}
-
+# ============================================================
+# Toggle: Light / Camera / World / Material (Blender 5.0 safe)
+# ============================================================
 
 class ToggleLightSettingsOperator(bpy.types.Operator):
     bl_idname = "wm.toggle_light_settings"
@@ -366,105 +468,158 @@ class ToggleLightSettingsOperator(bpy.types.Operator):
 
     def execute(self, context):
         scene = context.scene
-        settings = scene.my_light_settings
+
+        # PropertyGroup must exist (defined elsewhere in the addon)
+        settings = getattr(scene, "my_light_settings", None)
+        if settings is None:
+            self.report({'ERROR'}, "Scene.my_light_settings is missing (PropertyGroup not registered?)")
+            return {'CANCELLED'}
+
+        eevee = getattr(scene, "eevee", None)
+
+        # Blender variants: viewport samples vs render samples
+        samples_names = ("taa_samples", "taa_render_samples")
+        # Blender 5.0: GTAO removed; Raytracing checkbox exists in Eevee Next
+        ray_flag_names = ("use_raytracing", "use_gtao")
+
+        # Ensure world + background node exist
+        world = _ensure_world(scene)
+        bg_node, _out_node = _get_or_create_world_bg_node(world)
+
+        # Ensure material exists and has Principled
+        material, principled_node = _get_or_create_principled_material("material0")
+        metallic_input, roughness_input, specular_input = _get_principled_inputs(principled_node)
 
         if not settings.is_custom_settings:
-            # Сохраняем текущие настройки
+            # -----------------------------
+            # Save current settings
+            # -----------------------------
             settings.engine = scene.render.engine
-            settings.samples = scene.eevee.taa_samples
-            settings.raytracing = scene.eevee.use_gtao
+
+            if eevee:
+                settings.samples = int(_get_first_attr(eevee, samples_names, default=0) or 0)
+                settings.raytracing = bool(_get_first_attr(eevee, ray_flag_names, default=False))
+            else:
+                settings.samples = 0
+                settings.raytracing = False
+
             settings.film_transparent = scene.render.film_transparent
 
-            world = scene.world
-            settings.world_color = world.node_tree.nodes["Background"].inputs[0].default_value[:]
-            settings.world_strength = world.node_tree.nodes["Background"].inputs[1].default_value
+            try:
+                settings.world_color = bg_node.inputs[0].default_value[:]
+                settings.world_strength = float(bg_node.inputs[1].default_value)
+            except Exception:
+                settings.world_color = (1.0, 1.0, 1.0, 1.0)
+                settings.world_strength = 1.0
 
-            material = bpy.data.materials.get("material0")
-            if not material or not material.use_nodes:
-                self.report({'ERROR'}, "Material 'material0' not found or does not use nodes")
-                return {'CANCELLED'}
+            # Save material params (if sockets exist)
+            if metallic_input is not None:
+                settings.material_metallic = float(metallic_input.default_value)
+            if roughness_input is not None:
+                settings.material_roughness = float(roughness_input.default_value)
+            if specular_input is not None:
+                settings.material_specular_ior = float(specular_input.default_value)
 
-            nodes = material.node_tree.nodes
-            principled_bsdf = next((node for node in nodes if node.type == 'BSDF_PRINCIPLED'), None)
-            if not principled_bsdf:
-                self.report({'ERROR'}, "Principled BSDF node not found in 'material0'")
-                return {'CANCELLED'}
-
-            metallic_input = principled_bsdf.inputs.get("Metallic")
-            roughness_input = principled_bsdf.inputs.get("Roughness")
-            specular_ior_input = principled_bsdf.inputs.get("Specular IOR Level")
-
-            settings.material_metallic = metallic_input.default_value
-            settings.material_roughness = roughness_input.default_value
-            settings.material_specular_ior = specular_ior_input.default_value
-
+            # Save camera
             camera = scene.camera.data if scene.camera else None
             if camera:
-                settings.focal_length = camera.lens
-                settings.clip_start = camera.clip_start
-                settings.clip_end = camera.clip_end
+                settings.focal_length = float(camera.lens)
+                settings.clip_start = float(camera.clip_start)
+                settings.clip_end = float(camera.clip_end)
 
-            # Применяем кастомные настройки
-            scene.render.engine = 'BLENDER_EEVEE_NEXT'
-            scene.eevee.taa_samples = 64
-            scene.eevee.use_gtao = True
+            # -----------------------------
+            # Apply custom settings
+            # -----------------------------
+            # Prefer Eevee Next if available
+            try:
+                enum_items = scene.render.bl_rna.properties["engine"].enum_items
+                if "BLENDER_EEVEE_NEXT" in enum_items.keys():
+                    scene.render.engine = "BLENDER_EEVEE_NEXT"
+                elif "BLENDER_EEVEE" in enum_items.keys():
+                    scene.render.engine = "BLENDER_EEVEE"
+            except Exception:
+                # fallback: keep current engine
+                pass
+
+            if eevee:
+                _set_first_attr(eevee, samples_names, 64)
+                _set_first_attr(eevee, ray_flag_names, True)
+
             scene.render.film_transparent = True
 
-            world.node_tree.nodes["Background"].inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
-            world.node_tree.nodes["Background"].inputs[1].default_value = 0.5
+            # World background: white + moderate strength
+            try:
+                bg_node.inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
+                bg_node.inputs[1].default_value = 0.5
+            except Exception:
+                pass
 
-            metallic_input.default_value = 0.0
-            roughness_input.default_value = 1.0
-            specular_ior_input.default_value = 0.0
+            # Material: matte, no specular
+            try:
+                if metallic_input is not None:
+                    metallic_input.default_value = 0.0
+                if roughness_input is not None:
+                    roughness_input.default_value = 1.0
+                if specular_input is not None:
+                    specular_input.default_value = 0.0
+            except Exception:
+                pass
 
+            # Camera defaults
+            camera = scene.camera.data if scene.camera else None
             if camera:
                 camera.lens = 50
                 camera.clip_start = 0.1
                 camera.clip_end = 10000
 
             settings.is_custom_settings = True
+
         else:
-            # Восстанавливаем сохранённые настройки
+            # -----------------------------
+            # Restore saved settings
+            # -----------------------------
             scene.render.engine = settings.engine
-            scene.eevee.taa_samples = settings.samples
-            scene.eevee.use_gtao = settings.raytracing
-            scene.render.film_transparent = settings.film_transparent
 
-            world = scene.world
-            world.node_tree.nodes["Background"].inputs[0].default_value = settings.world_color
-            world.node_tree.nodes["Background"].inputs[1].default_value = settings.world_strength
+            if eevee:
+                _set_first_attr(eevee, samples_names, int(settings.samples))
+                _set_first_attr(eevee, ray_flag_names, bool(settings.raytracing))
 
-            material = bpy.data.materials.get("material0")
-            if not material or not material.use_nodes:
-                self.report({'ERROR'}, "Material 'material0' not found or does not use nodes")
-                return {'CANCELLED'}
+            scene.render.film_transparent = bool(settings.film_transparent)
 
-            nodes = material.node_tree.nodes
-            principled_bsdf = next((node for node in nodes if node.type == 'BSDF_PRINCIPLED'), None)
-            if not principled_bsdf:
-                self.report({'ERROR'}, "Principled BSDF node not found in 'material0'")
-                return {'CANCELLED'}
+            # World restore
+            try:
+                bg_node.inputs[0].default_value = settings.world_color
+                bg_node.inputs[1].default_value = float(settings.world_strength)
+            except Exception:
+                pass
 
-            metallic_input = principled_bsdf.inputs.get("Metallic")
-            roughness_input = principled_bsdf.inputs.get("Roughness")
-            specular_ior_input = principled_bsdf.inputs.get("Specular IOR Level")
+            # Material restore (if sockets exist)
+            try:
+                if metallic_input is not None:
+                    metallic_input.default_value = float(settings.material_metallic)
+                if roughness_input is not None:
+                    roughness_input.default_value = float(settings.material_roughness)
+                if specular_input is not None:
+                    specular_input.default_value = float(settings.material_specular_ior)
+            except Exception:
+                pass
 
-            metallic_input.default_value = settings.material_metallic
-            roughness_input.default_value = settings.material_roughness
-            specular_ior_input.default_value = settings.material_specular_ior
-
+            # Camera restore
             camera = scene.camera.data if scene.camera else None
             if camera:
-                camera.lens = settings.focal_length
-                camera.clip_start = settings.clip_start
-                camera.clip_end = settings.clip_end
+                camera.lens = float(settings.focal_length)
+                camera.clip_start = float(settings.clip_start)
+                camera.clip_end = float(settings.clip_end)
 
             settings.is_custom_settings = False
 
         return {'FINISHED'}
 
 
-# Добавляем исправленный класс ToggleRulerSettingsOperator
+# ============================================================
+# Toggle: Ruler annotation settings
+# ============================================================
+
 class ToggleRulerSettingsOperator(bpy.types.Operator):
     bl_idname = "wm.toggle_ruler_settings"
     bl_label = "Toggle Ruler Settings"
@@ -472,37 +627,78 @@ class ToggleRulerSettingsOperator(bpy.types.Operator):
 
     def execute(self, context):
         scene = context.scene
-        settings = scene.my_ruler_settings
 
-        ruler_layer = None
-        for annotation in scene.grease_pencil.layers:
-            if annotation.info == "RulerData3D":
-                ruler_layer = annotation
-                break
-
-        if not ruler_layer:
-            self.report({'ERROR'}, "RulerData3D layer not found in Annotations")
+        settings = getattr(scene, "my_ruler_settings", None)
+        if settings is None:
+            self.report({'ERROR'}, "Scene.my_ruler_settings is missing (PropertyGroup not registered?)")
             return {'CANCELLED'}
 
-        ruler_layer.hide = False  # Включаем слой
+        _, ruler_layer = _find_ruler_layer("RulerData3D")
+        if not ruler_layer:
+            self.report({'ERROR'}, "RulerData3D layer not found (no Measure annotations in the scene?)")
+            return {'CANCELLED'}
+
+        # Ensure the layer is visible
+        if hasattr(ruler_layer, "hide"):
+            try:
+                ruler_layer.hide = False
+            except Exception:
+                pass
 
         if not settings.is_custom_ruler:
-            # Сохраняем текущие настройки
-            settings.color = ruler_layer.color[:]
-            settings.opacity = ruler_layer.opacity
-            settings.thickness = ruler_layer.thickness
+            # Save current settings
+            try:
+                if hasattr(ruler_layer, "color"):
+                    settings.color = ruler_layer.color[:]
+            except Exception:
+                pass
+            try:
+                if hasattr(ruler_layer, "opacity"):
+                    settings.opacity = float(ruler_layer.opacity)
+            except Exception:
+                pass
+            try:
+                if hasattr(ruler_layer, "thickness"):
+                    settings.thickness = int(ruler_layer.thickness)
+            except Exception:
+                pass
 
-            # Применяем кастомные настройки
-            ruler_layer.color = (1.0, 0.0, 0.0)  # Красный цвет
-            ruler_layer.opacity = 0.7
-            ruler_layer.thickness = 7
+            # Apply custom settings
+            try:
+                if hasattr(ruler_layer, "color"):
+                    ruler_layer.color = (1.0, 0.0, 0.0)  # Red
+            except Exception:
+                pass
+            try:
+                if hasattr(ruler_layer, "opacity"):
+                    ruler_layer.opacity = 0.7
+            except Exception:
+                pass
+            try:
+                if hasattr(ruler_layer, "thickness"):
+                    ruler_layer.thickness = 7
+            except Exception:
+                pass
+
             settings.is_custom_ruler = True
         else:
-            # Восстанавливаем сохранённые настройки
-            ruler_layer.color = settings.color
-            ruler_layer.opacity = settings.opacity
-            ruler_layer.thickness = settings.thickness
+            # Restore saved settings
+            try:
+                if hasattr(ruler_layer, "color"):
+                    ruler_layer.color = settings.color
+            except Exception:
+                pass
+            try:
+                if hasattr(ruler_layer, "opacity"):
+                    ruler_layer.opacity = float(settings.opacity)
+            except Exception:
+                pass
+            try:
+                if hasattr(ruler_layer, "thickness"):
+                    ruler_layer.thickness = int(settings.thickness)
+            except Exception:
+                pass
+
             settings.is_custom_ruler = False
 
         return {'FINISHED'}
-

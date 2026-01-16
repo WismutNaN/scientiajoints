@@ -1,8 +1,8 @@
 bl_info = {
     "name": "ScientiaJoints",
     "author": "Scientia, Ivan Guzeev",
-    "version": (2, 1),
-    "blender": (4, 2, 0),
+    "version": (2, 2),
+    "blender": (5, 0, 1),
     "location": "View3D > Sidebar > ScientiaJoints",
     "description": "Export measurements with visualizations and adjustable settings",
     "category": "Object",
@@ -19,6 +19,7 @@ from bpy.props import (
     IntProperty,
     PointerProperty,
     StringProperty,
+    EnumProperty,
 )
 
 # Set up logging
@@ -172,6 +173,48 @@ def register():
         max=5.0
     )
 
+
+    bpy.types.Scene.marker_face_color = FloatVectorProperty(
+        name="Point Color",
+        description="Color of points (poles) on the stereonet",
+        subtype='COLOR',
+        size=3,
+        default=(1.0, 1.0, 1.0),
+        min=0.0,
+        max=1.0
+    )
+
+    bpy.types.Scene.marker_edge_color = FloatVectorProperty(
+        name="Outline Color",
+        description="Outline (edge) color of points (poles) on the stereonet",
+        subtype='COLOR',
+        size=3,
+        default=(0.0, 0.0, 0.0),
+        min=0.0,
+        max=1.0
+    )
+
+    bpy.types.Scene.density_sigma = FloatProperty(
+        name="Density Sigma",
+        description="Smoothing parameter (sigma) for stereonet density contours",
+        default=1.2,
+        min=0.1,
+        max=6.0,
+        step=10,
+        precision=1
+    )
+
+    bpy.types.Scene.stereonet_hemisphere = EnumProperty(
+        name="Hemisphere",
+        description="Hemisphere for stereonet plotting",
+        items=[
+            ('UPPER', 'Upper', 'Upper hemisphere'),
+            ('LOWER', 'Lower', 'Lower hemisphere (dip direction + 180°)'),
+        ],
+        default='UPPER'
+    )
+
+
     bpy.types.Scene.real_time_update_histogram = BoolProperty(
         name="Real-Time Update",
         description="Toggle real-time updating of the histogram",
@@ -248,6 +291,10 @@ def unregister():
         del bpy.types.Scene.figure_height
         del bpy.types.Scene.marker_size
         del bpy.types.Scene.edge_width
+        del bpy.types.Scene.marker_face_color
+        del bpy.types.Scene.marker_edge_color
+        del bpy.types.Scene.density_sigma
+        del bpy.types.Scene.stereonet_hemisphere
         del bpy.types.Scene.real_time_update_histogram
         del bpy.types.Scene.real_time_update_stereonet
         del bpy.types.Scene.update_interval

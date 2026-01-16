@@ -7,11 +7,27 @@ logger = logging.getLogger(__name__)
 class Point:
     """Point with coordinates in 3D space."""
     def __init__(self, vector):
+        # Blender annotation/grease pencil point classes have changed names and sometimes
+        # changed attribute layout between versions. We accept several common layouts:
+        # - point.co (legacy GPencilPoint / ruler points)
+        # - point.position (some newer stroke point APIs)
+        # - point.location (occasionally used in custom wrappers)
+        # - direct x/y/z (Vector-like objects)
         try:
             if hasattr(vector, 'co'):
                 self.x = vector.co.x
                 self.y = vector.co.y
                 self.z = vector.co.z
+            elif hasattr(vector, 'position'):
+                pos = vector.position
+                self.x = pos.x
+                self.y = pos.y
+                self.z = pos.z
+            elif hasattr(vector, 'location'):
+                loc = vector.location
+                self.x = loc.x
+                self.y = loc.y
+                self.z = loc.z
             else:
                 self.x = vector.x
                 self.y = vector.y

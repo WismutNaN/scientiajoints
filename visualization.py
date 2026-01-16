@@ -6,13 +6,17 @@ from .parser import MeasurementsParser
 logger = logging.getLogger(__name__)
 
 class Visualizer:
-    def __init__(self, edges_data, faces_data, figure_width=6.0, figure_height=6.0, marker_size=2.0, edge_width=0.4):
+    def __init__(self, edges_data, faces_data, figure_width=6.0, figure_height=6.0, marker_size=2.0, edge_width=0.4, marker_face_color=(1.0, 1.0, 1.0), marker_edge_color=(0.0, 0.0, 0.0), density_sigma=1.2, hemisphere='UPPER'):
         self.edges_data = edges_data
         self.faces_data = faces_data
         self.figure_width = figure_width
         self.figure_height = figure_height
         self.marker_size = marker_size
         self.edge_width = edge_width
+        self.marker_face_color = marker_face_color
+        self.marker_edge_color = marker_edge_color
+        self.density_sigma = density_sigma
+        self.hemisphere = hemisphere
 
     def get_edges_statistics(self):
         import numpy as np
@@ -85,7 +89,10 @@ class Visualizer:
             dips = []
 
             for face in self.faces_data:
-                strike = (face.rotated_azimuth + 90) % 360
+                dip_dir = face.rotated_azimuth
+                if str(self.hemisphere).upper() == 'LOWER':
+                    dip_dir = (dip_dir + 180) % 360
+                strike = (dip_dir + 90) % 360
                 dip = face.dip
                 strikes.append(strike)
                 dips.append(dip)
@@ -105,6 +112,7 @@ class Visualizer:
                 strikes, dips,
                 measurement='poles',
                 method='exponential_kamb',
+                sigma=self.density_sigma,
                 cmap=custom_cmap
             )
 
@@ -112,8 +120,8 @@ class Visualizer:
             ax.pole(
                 strikes, dips,
                 marker='o',
-                markerfacecolor='white',
-                markeredgecolor='black',
+                markerfacecolor=self.marker_face_color,
+                markeredgecolor=self.marker_edge_color,
                 markersize=self.marker_size,
                 markeredgewidth=self.edge_width
             )
@@ -167,10 +175,14 @@ def update_stereonet_image(context, report_errors=True):
     figure_height = context.scene.figure_height
     marker_size = context.scene.marker_size
     edge_width = context.scene.edge_width
+    marker_face_color = tuple(context.scene.marker_face_color)
+    marker_edge_color = tuple(context.scene.marker_edge_color)
+    density_sigma = context.scene.density_sigma
+    hemisphere = context.scene.stereonet_hemisphere
 
     processed_faces = parser.get_processed_faces(az_real=az_real, az_model=az_model)
 
-    visualizer = Visualizer([], processed_faces, figure_width=figure_width, figure_height=figure_height, marker_size=marker_size, edge_width=edge_width)
+    visualizer = Visualizer([], processed_faces, figure_width=figure_width, figure_height=figure_height, marker_size=marker_size, edge_width=edge_width, marker_face_color=marker_face_color, marker_edge_color=marker_edge_color, density_sigma=density_sigma, hemisphere=hemisphere)
     stereonet_path = visualizer.plot_faces_stereonet()
 
     if stereonet_path and os.path.exists(stereonet_path):

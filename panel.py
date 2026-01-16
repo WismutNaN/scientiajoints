@@ -66,7 +66,21 @@ class MeasurementExporterPanel(Panel):
             col.label(text="Stereonet Marker Size and Edge Width:")
             row = col.row(align=True)
             row.prop(context.scene, "marker_size", text="Marker Size", icon="PROP_OFF")
-            row.prop(context.scene, "edge_width", text="Edge Width", icon="PROP_CON")
+            row.prop(context.scene, "edge_width", text="Outline Width", icon="PROP_CON")
+
+            col.label(text="Stereonet Point Style:")
+            row = col.row(align=True)
+            row.prop(context.scene, "marker_face_color", text="Color")
+            row.prop(context.scene, "marker_edge_color", text="Outline")
+
+            col.label(text="Density Contours:")
+            row = col.row(align=True)
+            row.prop(context.scene, "density_sigma", text="Sigma")
+
+            col.label(text="Hemisphere:")
+            row = col.row(align=True)
+            row.prop(context.scene, "stereonet_hemisphere", expand=True)
+
 
             col.label(text="View Settings")
             row = col.row(align=True)
