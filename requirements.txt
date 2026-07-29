@@ -1,0 +1,6 @@
+matplotlib
+# 0.6.2 and older use np.float, removed in numpy 1.24, so every stereonet
+# density contour fails on the numpy Blender 5.x ships. See MINIMUM_VERSIONS
+# in dependencies.py.
+mplstereonet>=0.6.3
+numpy

@@ -1,0 +1,26 @@
+# Blender extension manifest.
+#
+# Used by the extension build (`python tools/build_release.py --format extension`).
+# The `wheels` and `platforms` fields are filled in by the build script from the
+# wheel files in `wheels/`, so Blender installs matplotlib and mplstereonet
+# straight from the archive: no pip, no package index, no network.
+schema_version = "1.0.0"
+
+id = "scientiajoints"
+# The add-on version, and the only place it is set. Change it with
+# `python tools/version.py <new version>`, which also updates the bl_info copy
+# in __init__.py; editing either file by hand makes the build fail.
+version = "3.3.3"
+name = "ScientiaJoints"
+tagline = "Fracture measurements with export, histograms and stereonets"
+maintainer = "Ivan Guzeev"
+type = "add-on"
+
+tags = ["3D View", "Object", "Import-Export"]
+blender_version_min = "5.0.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Write exported measurements and reports next to the .blend file"
+clipboard = "Copy the diagnostics report when the user asks for it"
+network = "Download chart packages when they are not bundled"

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+dist/
+
+# Release wheels are large binaries fetched by tools/fetch_wheels.py.
+wheels/
+
+*.blend1
+*.blend2

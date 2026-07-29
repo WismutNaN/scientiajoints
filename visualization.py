@@ -1,9 +1,43 @@
 import bpy
+import contextlib
 import logging
 import os
 from .parser import MeasurementsParser
 
 logger = logging.getLogger(__name__)
+
+#: Aliases numpy removed in 1.24. ``mplstereonet`` up to 0.6.2 still writes
+#: ``dtype=np.float``, so on the numpy 2.x that Blender 5.x ships every density
+#: contour raised ``module 'numpy' has no attribute 'float'`` and the stereonet
+#: came out with poles but no density. 0.6.3 fixes it upstream and is what the
+#: release bundles; this keeps an already installed older copy working.
+#: Kept to the two names mplstereonet uses. ``np.bool`` and ``np.object`` are
+#: left alone: numpy 2.x defines the first and warns about the second.
+_NUMPY_REMOVED_ALIASES = {"float": float, "int": int}
+
+
+@contextlib.contextmanager
+def _numpy_legacy_aliases():
+    """Restore the removed numpy aliases for the duration of the block.
+
+    They have to go on the numpy module itself, because the affected code does
+    ``import numpy as np`` and looks the attribute up at call time. Everything
+    is removed again on the way out so no other add-on sees a numpy that
+    disagrees with its own version.
+    """
+    import numpy as np
+
+    added = [name for name in _NUMPY_REMOVED_ALIASES if not hasattr(np, name)]
+    for name in added:
+        setattr(np, name, _NUMPY_REMOVED_ALIASES[name])
+    try:
+        yield
+    finally:
+        for name in added:
+            try:
+                delattr(np, name)
+            except Exception:
+                pass
 
 class Visualizer:
     def __init__(self, edges_data, faces_data, figure_width=6.0, figure_height=6.0, marker_size=2.0, edge_width=0.4, marker_face_color=(1.0, 1.0, 1.0), marker_edge_color=(0.0, 0.0, 0.0), density_sigma=1.2, hemisphere='UPPER'):
@@ -38,21 +72,20 @@ class Visualizer:
             }
             return stats
         except Exception as e:
-            logger.error(f"Error calculating edge statistics: {e}")
+            logger.error("Error calculating edge statistics: %s", e, exc_info=True)
             return {}
 
     def plot_edges_histogram(self):
+        lengths = [edge.length for edge in self.edges_data]
+        if not lengths:
+            logger.warning("No edge data to plot.")
+            return None, {}
+
         try:
             import matplotlib
-            matplotlib.use('Agg')  # Use 'Agg' backend for rendering without GUI
+            matplotlib.use('Agg', force=True)  # Use 'Agg' backend for rendering without GUI
             import matplotlib.pyplot as plt
-            import numpy as np
             import tempfile
-
-            lengths = [edge.length for edge in self.edges_data]
-            if not lengths:
-                logger.warning("No edge data to plot.")
-                return None, {}
 
             stats = self.get_edges_statistics()
 
@@ -71,22 +104,25 @@ class Visualizer:
 
             return histogram_path, stats
         except Exception as e:
-            logger.error(f"Error generating edges histogram: {e}")
+            logger.error("Error generating edges histogram: %s", e, exc_info=True)
             return None, {}
 
     def plot_faces_stereonet(self):
+        if not self.faces_data:
+            logger.warning("No face data to plot.")
+            return None
+
         try:
+            import matplotlib
+            matplotlib.use('Agg', force=True)  # Use 'Agg' backend for rendering without GUI
             import mplstereonet
             import matplotlib.pyplot as plt
             import matplotlib.colors
             import tempfile
 
-            if not self.faces_data:
-                logger.warning("No face data to plot.")
-                return None
-
             strikes = []
             dips = []
+            pole_groups = {}
 
             for face in self.faces_data:
                 dip_dir = face.rotated_azimuth
@@ -96,44 +132,56 @@ class Visualizer:
                 dip = face.dip
                 strikes.append(strike)
                 dips.append(dip)
+                color = _marker_color(getattr(face, "color", None), self.marker_face_color)
+                pole_groups.setdefault(color, ([], []))
+                pole_groups[color][0].append(strike)
+                pole_groups[color][1].append(dip)
 
-            fig, ax = mplstereonet.subplots(figsize=(self.figure_width, self.figure_height))
-            ax.grid(kind='polar')
+            # mplstereonet reaches for numpy attributes that no longer exist;
+            # see _numpy_legacy_aliases. The whole figure is built inside the
+            # block because the drawing code runs as late as savefig().
+            with _numpy_legacy_aliases():
+                fig, ax = mplstereonet.subplots(figsize=(self.figure_width, self.figure_height))
+                ax.grid(kind='polar')
 
-            # Create custom colormap
-            custom_cmap = matplotlib.colors.ListedColormap([
-                '#ffffff', '#ecf0f5', '#d3eef1', '#b6f2de',
-                '#97f5ac', '#94f877', '#c5fb58', '#fde839',
-                '#fe811c', '#ff0000'
-            ])
+                # Create custom colormap
+                custom_cmap = matplotlib.colors.ListedColormap([
+                    '#ffffff', '#ecf0f5', '#d3eef1', '#b6f2de',
+                    '#97f5ac', '#94f877', '#c5fb58', '#fde839',
+                    '#fe811c', '#ff0000'
+                ])
 
-            # Plot density contour fill
-            ax.density_contourf(
-                strikes, dips,
-                measurement='poles',
-                method='exponential_kamb',
-                sigma=self.density_sigma,
-                cmap=custom_cmap
-            )
+                # Density contours can fail for very small datasets; poles are still useful.
+                try:
+                    ax.density_contourf(
+                        strikes, dips,
+                        measurement='poles',
+                        method='exponential_kamb',
+                        sigma=self.density_sigma,
+                        cmap=custom_cmap
+                    )
+                except Exception as e:
+                    logger.warning("Stereonet density contours were skipped: %s", e)
 
-            # Plot poles with specified style
-            ax.pole(
-                strikes, dips,
-                marker='o',
-                markerfacecolor=self.marker_face_color,
-                markeredgecolor=self.marker_edge_color,
-                markersize=self.marker_size,
-                markeredgewidth=self.edge_width
-            )
+                # Plot poles grouped by measurement/code color.
+                for marker_color, (group_strikes, group_dips) in pole_groups.items():
+                    ax.pole(
+                        group_strikes, group_dips,
+                        marker='o',
+                        markerfacecolor=marker_color,
+                        markeredgecolor=self.marker_edge_color,
+                        markersize=self.marker_size,
+                        markeredgewidth=self.edge_width
+                    )
 
-            temp_dir = tempfile.gettempdir()
-            stereonet_path = os.path.join(temp_dir, 'faces_stereonet.png')
-            fig.savefig(stereonet_path)
-            plt.close(fig)
+                temp_dir = tempfile.gettempdir()
+                stereonet_path = os.path.join(temp_dir, 'faces_stereonet.png')
+                fig.savefig(stereonet_path)
+                plt.close(fig)
             logger.info(f"Faces stereonet saved to {stereonet_path}")
             return stereonet_path
         except Exception as e:
-            logger.error(f"Error generating faces stereonet: {e}")
+            logger.error("Error generating faces stereonet: %s", e, exc_info=True)
             return None
 
 def update_histogram_image(context, report_errors=True):
@@ -162,9 +210,11 @@ def update_histogram_image(context, report_errors=True):
         # Open image in Image Editor
         open_image_in_image_editor(image)
         logger.info("Histogram image updated.")
+        return True
     else:
         if report_errors:
             logger.warning("Histogram image not found.")
+        return False
 
 def update_stereonet_image(context, report_errors=True):
     import os
@@ -198,9 +248,11 @@ def update_stereonet_image(context, report_errors=True):
         # Open image in Image Editor
         open_image_in_image_editor(image)
         logger.info("Stereonet image updated.")
+        return True
     else:
         if report_errors:
             logger.warning("Stereonet image not found.")
+        return False
 
 def open_image_in_image_editor(image):
     for area in bpy.context.screen.areas:
@@ -212,3 +264,15 @@ def open_image_in_image_editor(image):
     new_area = bpy.context.screen.areas[-1]
     new_area.type = 'IMAGE_EDITOR'
     new_area.spaces.active.image = image
+
+
+def _marker_color(color, fallback):
+    if color is None:
+        return tuple(fallback)
+    try:
+        values = tuple(float(channel) for channel in color)
+    except Exception:
+        return tuple(fallback)
+    if len(values) == 3 or len(values) == 4:
+        return values
+    return tuple(fallback)
