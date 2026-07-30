@@ -7,17 +7,19 @@ every step it takes and every reason an attempt can fail:
 
 - Blender's interpreter is resolved without ever launching ``blender.exe``.
 - ``pip install --user`` is never used: Blender disables the user site.
-- The install directory is picked from candidates that are actually on
-  ``sys.path``, actually writable, and short enough for the Windows 260
-  character path limit (a longer path silently breaks ``matplotlib`` at import
-  time even though every file is on disk).
-- ``numpy`` is pinned to the version bundled with Blender so a ``--target``
-  install cannot introduce a second, ABI-incompatible copy.
+- The install directory is picked from candidates that are importable already
+  or deliberately added to ``sys.path``, actually writable, and short enough
+  for the Windows 260 character path limit (a longer path silently breaks
+  ``matplotlib`` at import time even though every file is on disk).
+- Offline installation uses the complete non-numpy wheel set with
+  ``--no-deps``; online installation pins numpy to Blender's version. Neither
+  route can introduce a second, ABI-incompatible copy.
 - Wheels shipped inside the add-on are preferred over PyPI, which makes the
   add-on installable on networks that block package indexes.
 - Every subprocess has a timeout and its output is captured into the result.
 """
 
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -63,8 +65,17 @@ LONGEST_RELATIVE_PACKAGE_PATH = 120
 WINDOWS_MAX_PATH = 260
 
 DEFAULT_PIP_TIMEOUT_SECONDS = 600.0
+DEFAULT_RUNTIME_PROBE_TIMEOUT_SECONDS = 10.0
+DEFAULT_PACKAGE_PROBE_TIMEOUT_SECONDS = 20.0
+DEFAULT_OFFLINE_PIP_TIMEOUT_SECONDS = 180.0
 #: Do not retry a failed automatic installation more often than this.
 INSTALL_RETRY_INTERVAL_SECONDS = 24 * 60 * 60
+# Bump when the automatic install preparation changes in a way that should
+# retry a previously failed build immediately instead of waiting a day.
+INSTALL_POLICY_VERSION = 3
+_AUTO_INSTALL_TARGET = object()
+_status_cache = {}
+_status_cache_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,10 @@ class DependencyStatus:
     error: str = ""
     version: str = ""
     location: str = ""
+    #: ``False`` means only the module specification was inspected. This is
+    #: intentionally enough for panel drawing, where importing matplotlib can
+    #: build its font cache and freeze Blender's UI.
+    verified: bool = True
 
 
 @dataclass(frozen=True)
@@ -86,6 +101,50 @@ class DependencyInstallResult:
     #: Which source finally worked: bundled wheels, PyPI, or nothing.
     source: str = ""
     target: str = ""
+    failed_stage: str = ""
+    error_source: str = ""
+    runtime: str = ""
+    compatible_wheels: tuple = ()
+
+
+@dataclass(frozen=True)
+class PythonRuntime:
+    """Identity of the Python process that will execute pip."""
+
+    executable: str
+    implementation: str
+    version: tuple
+    cache_tag: str
+    bits: int
+    system: str
+    machine: str
+    prefix: str = ""
+    exec_prefix: str = ""
+
+    @property
+    def version_text(self):
+        return ".".join(str(part) for part in self.version)
+
+    @property
+    def summary(self):
+        implementation = {
+            "cpython": "CPython",
+            "pypy": "PyPy",
+        }.get((self.implementation or "").lower(), (self.implementation or "Python").capitalize())
+        tag = f", {self.cache_tag}" if self.cache_tag else ""
+        return (
+            f"{implementation} {self.version_text}{tag}, {self.bits}-bit "
+            f"{self.system or 'unknown'} {self.machine or 'unknown'}"
+        )
+
+
+@dataclass(frozen=True)
+class WheelSelection:
+    compatible: tuple
+    incompatible: tuple
+    distributions: tuple
+    supported_tag_sample: tuple = ()
+    errors: tuple = ()
 
 
 @dataclass
@@ -98,10 +157,15 @@ class InstallTarget:
     writable: bool
     path_budget_ok: bool
     note: str = ""
+    writable_checked: bool = True
 
     @property
     def usable(self):
-        return self.writable and self.path_budget_ok and (self.on_sys_path or self.kind == "interpreter")
+        # A managed --target directory can be added to sys.path before pip
+        # starts. Requiring it to have existed at Blender startup made the
+        # normal per-user modules directory impossible to use on a clean
+        # installation.
+        return self.writable and self.path_budget_ok
 
 
 @dataclass
@@ -138,7 +202,7 @@ def _version_key(version):
     return tuple(parts)
 
 
-def outdated_packages(packages=REQUIRED_PACKAGES):
+def outdated_packages(packages=REQUIRED_PACKAGES, statuses=None):
     """Installed packages older than :data:`MINIMUM_VERSIONS` requires.
 
     Each entry is ``(name, installed version, required version)``. A package
@@ -147,7 +211,7 @@ def outdated_packages(packages=REQUIRED_PACKAGES):
     working dependencies.
     """
     outdated = []
-    for status in check_required_packages(packages):
+    for status in statuses if statuses is not None else check_required_packages(packages):
         minimum = MINIMUM_VERSIONS.get(status.name)
         if not status.installed or not minimum or not status.version:
             continue
@@ -200,22 +264,100 @@ def check_required_packages(packages=REQUIRED_PACKAGES):
                 error="" if error == "not installed" else error,
                 version=version,
                 location=location,
+                verified=True,
+            )
+        )
+    statuses = tuple(statuses)
+    cache_dependency_statuses(statuses)
+    return statuses
+
+
+def lightweight_package_statuses(packages=REQUIRED_PACKAGES):
+    """Inspect import specs and metadata without importing third-party code.
+
+    This function is safe to call from panel drawing and the quick diagnostics
+    popup. A found package is marked ``verified=False`` until the background
+    probe has imported it in a disposable Python process.
+    """
+    statuses = []
+    for package in packages:
+        try:
+            spec = importlib.util.find_spec(package)
+        except Exception as e:
+            statuses.append(
+                DependencyStatus(
+                    package,
+                    False,
+                    error=f"Module discovery failed: {type(e).__name__}: {e}",
+                    verified=False,
+                )
+            )
+            continue
+
+        if spec is None:
+            statuses.append(DependencyStatus(package, False, verified=False))
+            continue
+
+        version = ""
+        try:
+            from importlib import metadata
+
+            version = str(metadata.version(_pip_name(package)) or "")
+        except Exception:
+            module = sys.modules.get(package)
+            version = str(getattr(module, "__version__", "") or "") if module is not None else ""
+        statuses.append(
+            DependencyStatus(
+                package,
+                True,
+                version=version,
+                location=str(getattr(spec, "origin", "") or ""),
+                verified=False,
             )
         )
     return tuple(statuses)
 
 
+def cache_dependency_statuses(statuses):
+    now = time.monotonic()
+    with _status_cache_lock:
+        for status in statuses:
+            _status_cache[status.name] = (now, status)
+
+
+def safe_dependency_statuses(packages=REQUIRED_PACKAGES):
+    """Return verified cached statuses, falling back to spec-only detection."""
+    requested = tuple(packages)
+    with _status_cache_lock:
+        cached = {name: _status_cache.get(name) for name in requested}
+    fallback = {status.name: status for status in lightweight_package_statuses(requested)}
+    return tuple(
+        cached[name][1]
+        if cached.get(name) is not None and cached[name][1].verified
+        else fallback[name]
+        for name in requested
+    )
+
+
 def missing_packages(packages=REQUIRED_PACKAGES):
-    return tuple(status.name for status in check_required_packages(packages) if not status.installed)
+    """Packages not discoverable without importing them on Blender's UI thread."""
+    return tuple(
+        status.name for status in safe_dependency_statuses(packages)
+        if not status.installed
+    )
 
 
 def dependency_summary(packages=REQUIRED_PACKAGES):
-    statuses = check_required_packages(packages)
+    statuses = safe_dependency_statuses(packages)
     missing = [status.name for status in statuses if not status.installed and not status.error]
     broken = [f"{status.name}: {status.error}" for status in statuses if status.error]
 
     if not missing and not broken:
-        return True, "Dependencies OK: " + ", ".join(status.name for status in statuses)
+        if all(status.verified for status in statuses):
+            return True, "Dependencies OK: " + ", ".join(status.name for status in statuses)
+        return True, "Dependencies found; background verification pending: " + ", ".join(
+            status.name for status in statuses
+        )
 
     parts = []
     if missing:
@@ -278,12 +420,14 @@ def bundled_package_versions(packages=BUNDLED_PACKAGES):
     versions = {}
     for package in packages:
         try:
-            if importlib.util.find_spec(package) is None:
-                continue
-            module = importlib.import_module(package)
+            from importlib import metadata
+
+            version = str(metadata.version(_pip_name(package)) or "")
         except Exception:
-            continue
-        version = str(getattr(module, "__version__", "") or "")
+            # Never import a binary package merely to prepare an install. If it
+            # has already been loaded, its version is still a safe fallback.
+            module = sys.modules.get(package)
+            version = str(getattr(module, "__version__", "") or "") if module is not None else ""
         if version:
             versions[_pip_name(package)] = version
     return versions
@@ -303,6 +447,103 @@ def _blender_binary_path():
         return ""
 
 
+def current_python_runtime(explicit=None):
+    """Describe Blender's active Python without starting another process."""
+    implementation = str(getattr(sys.implementation, "name", "") or "")
+    cache_tag = str(getattr(sys.implementation, "cache_tag", "") or "")
+    return PythonRuntime(
+        executable=resolve_python_executable(explicit),
+        implementation=implementation,
+        version=tuple(sys.version_info[:3]),
+        cache_tag=cache_tag,
+        bits=64 if sys.maxsize > 2**32 else 32,
+        system=platform.system(),
+        machine=platform.machine(),
+        prefix=str(sys.prefix),
+        exec_prefix=str(sys.exec_prefix),
+    )
+
+
+def probe_python_runtime(python_executable, timeout=DEFAULT_RUNTIME_PROBE_TIMEOUT_SECONDS):
+    """Start the selected interpreter briefly and return its actual identity.
+
+    The probe has a hard timeout and is only called by the background worker.
+    A bad executable can therefore never turn into a frozen Blender window.
+    """
+    script = (
+        "import json,platform,struct,sys;"
+        "print(json.dumps({"
+        "'executable':sys.executable,"
+        "'implementation':sys.implementation.name,"
+        "'version':list(sys.version_info[:3]),"
+        "'cache_tag':getattr(sys.implementation,'cache_tag',''),"
+        "'bits':struct.calcsize('P')*8,"
+        "'system':platform.system(),"
+        "'machine':platform.machine(),"
+        "'prefix':sys.prefix,"
+        "'exec_prefix':sys.exec_prefix"
+        "}))"
+    )
+    try:
+        completed = subprocess.run(
+            [python_executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            **_subprocess_flags(),
+        )
+    except subprocess.TimeoutExpired:
+        return None, (
+            f"Python runtime detection timed out after {timeout:.0f} s at "
+            f"{python_executable}; the process was stopped."
+        )
+    except Exception as e:
+        return None, f"Could not start {python_executable}: {type(e).__name__}: {e}"
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        return None, (
+            f"Python runtime detection failed at {python_executable}: "
+            f"{detail[-1][:500] if detail else f'exit code {completed.returncode}'}"
+        )
+    try:
+        data = json.loads((completed.stdout or "").strip().splitlines()[-1])
+        return PythonRuntime(
+            executable=str(data.get("executable") or python_executable),
+            implementation=str(data.get("implementation") or ""),
+            version=tuple(int(part) for part in data.get("version", ())),
+            cache_tag=str(data.get("cache_tag") or ""),
+            bits=int(data.get("bits") or 0),
+            system=str(data.get("system") or ""),
+            machine=str(data.get("machine") or ""),
+            prefix=str(data.get("prefix") or ""),
+            exec_prefix=str(data.get("exec_prefix") or ""),
+        ), ""
+    except Exception as e:
+        return None, f"Python runtime detection returned invalid data: {type(e).__name__}: {e}"
+
+
+def runtime_mismatch(expected, actual):
+    """Explain why an executable cannot install for the active Blender."""
+    if expected is None or actual is None:
+        return ""
+    if expected.implementation != actual.implementation:
+        return (
+            f"implementation is {actual.implementation}, but Blender uses "
+            f"{expected.implementation}"
+        )
+    if tuple(expected.version[:2]) != tuple(actual.version[:2]):
+        return (
+            f"version is {actual.version_text}, but Blender uses "
+            f"{expected.version_text}"
+        )
+    if expected.bits != actual.bits:
+        return f"architecture is {actual.bits}-bit, but Blender uses {expected.bits}-bit"
+    if expected.system and actual.system and expected.system.lower() != actual.system.lower():
+        return f"platform is {actual.system}, but Blender runs on {expected.system}"
+    return ""
+
+
 def resolve_python_executable(explicit=None):
     """Return a path to the Python interpreter, never the Blender binary.
 
@@ -318,9 +559,14 @@ def resolve_python_executable(explicit=None):
         and binary
         and os.path.normcase(os.path.abspath(candidate)) == os.path.normcase(os.path.abspath(binary))
     )
-    if candidate and not looks_like_blender and os.path.basename(candidate).lower().startswith("python"):
+    if (
+        candidate
+        and not looks_like_blender
+        and os.path.basename(candidate).lower().startswith("python")
+        and (explicit is not None or Path(candidate).is_file())
+    ):
         return candidate
-    if candidate and not looks_like_blender and not binary:
+    if candidate and not looks_like_blender and not binary and Path(candidate).is_file():
         return candidate
 
     for relative in ("bin/python.exe", "bin/python3.exe", "python.exe", "bin/python3", "bin/python"):
@@ -357,16 +603,26 @@ def path_budget(path):
     return WINDOWS_MAX_PATH - len(str(Path(path).absolute())) - 1
 
 
-def _user_scripts_modules_directory():
+def _user_scripts_modules_directory(create=True):
     try:
         import bpy
 
+        try:
+            # Blender's importable per-user directory is <SCRIPTS>/modules,
+            # not <SCRIPTS>/addons/modules.
+            modules = bpy.utils.user_resource('SCRIPTS', path="modules", create=create)
+            if modules:
+                return str(Path(modules))
+        except TypeError:
+            # Older API-compatible stubs and Blender builds only accept the
+            # resource type. The fallback below keeps the same correct path.
+            pass
         scripts = bpy.utils.user_resource('SCRIPTS')
     except Exception:
         return ""
     if not scripts:
         return ""
-    return str(Path(scripts) / "addons" / "modules")
+    return str(Path(scripts) / "modules")
 
 
 def _interpreter_site_packages():
@@ -391,16 +647,30 @@ def _sys_path_set():
     return {os.path.normcase(os.path.abspath(entry)) for entry in sys.path if entry}
 
 
-def install_target_candidates():
+def install_target_candidates(probe_writable=True):
     """Ordered install directories, best first.
 
-    The interpreter's own ``site-packages`` is preferred because pip then sees
-    the bundled ``numpy`` and skips it entirely. It is unwritable whenever
-    Blender lives in ``Program Files``, which is why the user scripts modules
-    directory (already on ``sys.path``) is the fallback.
+    The per-user ``scripts/modules`` directory is preferred. It follows the
+    active Blender profile, survives Blender upgrades, and never modifies the
+    application's installation directory. Writability can be deferred to the
+    worker so opening diagnostics and pressing Install stay instantaneous.
     """
     candidates = []
     known_paths = _sys_path_set()
+
+    modules_directory = _user_scripts_modules_directory(create=probe_writable)
+    if modules_directory:
+        candidates.append(
+            InstallTarget(
+                path=modules_directory,
+                kind="target",
+                on_sys_path=os.path.normcase(os.path.abspath(modules_directory)) in known_paths,
+                writable=_directory_is_writable(modules_directory) if probe_writable else True,
+                path_budget_ok=path_budget(modules_directory) >= LONGEST_RELATIVE_PACKAGE_PATH,
+                note="Blender user scripts modules directory",
+                writable_checked=probe_writable,
+            )
+        )
 
     site_packages = _interpreter_site_packages()
     if site_packages:
@@ -409,33 +679,36 @@ def install_target_candidates():
                 path=site_packages,
                 kind="interpreter",
                 on_sys_path=True,
-                writable=_directory_is_writable(site_packages),
+                writable=_directory_is_writable(site_packages) if probe_writable else True,
                 path_budget_ok=path_budget(site_packages) >= LONGEST_RELATIVE_PACKAGE_PATH,
-                note="Blender bundled Python site-packages",
-            )
-        )
-
-    modules_directory = _user_scripts_modules_directory()
-    if modules_directory:
-        candidates.append(
-            InstallTarget(
-                path=modules_directory,
-                kind="target",
-                on_sys_path=os.path.normcase(os.path.abspath(modules_directory)) in known_paths,
-                writable=_directory_is_writable(modules_directory),
-                path_budget_ok=path_budget(modules_directory) >= LONGEST_RELATIVE_PACKAGE_PATH,
-                note="Blender user scripts modules directory",
+                note="Blender bundled Python site-packages (fallback)",
+                writable_checked=probe_writable,
             )
         )
 
     return tuple(candidates)
 
 
-def choose_install_target():
-    for candidate in install_target_candidates():
+def choose_install_target(probe_writable=True):
+    for candidate in install_target_candidates(probe_writable=probe_writable):
         if candidate.usable:
             return candidate
     return None
+
+
+def validate_install_target(target):
+    """Validate and create a prepared target on the background worker."""
+    if target is None:
+        return None
+    return InstallTarget(
+        path=target.path,
+        kind=target.kind,
+        on_sys_path=target.on_sys_path,
+        writable=_directory_is_writable(target.path),
+        path_budget_ok=path_budget(target.path) >= LONGEST_RELATIVE_PACKAGE_PATH,
+        note=target.note,
+        writable_checked=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +718,10 @@ def choose_install_target():
 
 def addon_wheels_directory():
     return str(Path(__file__).resolve().parent / WHEELS_DIRECTORY_NAME)
+
+
+def installed_as_extension():
+    return (__package__ or "").startswith("bl_ext.")
 
 
 def wheel_directories(extra=()):
@@ -462,12 +739,77 @@ def available_wheels(extra=()):
     return tuple(wheels)
 
 
+def _packaging_api():
+    """Use packaging directly, or pip's bundled copy in minimal Blender Python."""
+    try:
+        from packaging.tags import sys_tags
+        from packaging.utils import canonicalize_name, parse_wheel_filename
+    except ImportError:
+        from pip._vendor.packaging.tags import sys_tags
+        from pip._vendor.packaging.utils import canonicalize_name, parse_wheel_filename
+    return sys_tags, canonicalize_name, parse_wheel_filename
+
+
+def select_compatible_wheels(wheels=None, supported_tags=None):
+    """Choose one best bundled wheel per distribution for this Python.
+
+    Unlike passing a whole directory to pip and hoping it selects correctly,
+    this preflight records incompatible files and passes only exact compatible
+    wheel paths to the offline install command.
+    """
+    wheels = tuple(available_wheels() if wheels is None else wheels)
+    try:
+        sys_tags, canonicalize_name, parse_wheel_filename = _packaging_api()
+        ordered_tags = tuple(supported_tags) if supported_tags is not None else tuple(sys_tags())
+    except Exception as e:
+        return WheelSelection(
+            (),
+            wheels,
+            (),
+            errors=(f"Could not calculate Python wheel tags: {type(e).__name__}: {e}",),
+        )
+
+    tag_rank = {str(tag): index for index, tag in enumerate(ordered_tags)}
+    selected = {}
+    incompatible = []
+    errors = []
+    for wheel in wheels:
+        try:
+            name, version, _build, tags = parse_wheel_filename(Path(wheel).name)
+            ranks = [tag_rank[str(tag)] for tag in tags if str(tag) in tag_rank]
+            if not ranks:
+                incompatible.append(wheel)
+                continue
+            distribution = canonicalize_name(str(name))
+            candidate = (version, -min(ranks), wheel)
+            previous = selected.get(distribution)
+            if previous is None or candidate[:2] > previous[:2]:
+                if previous is not None:
+                    incompatible.append(previous[2])
+                selected[distribution] = candidate
+            else:
+                incompatible.append(wheel)
+        except Exception as e:
+            incompatible.append(wheel)
+            errors.append(f"{Path(wheel).name}: {type(e).__name__}: {e}")
+
+    compatible = tuple(selected[name][2] for name in sorted(selected))
+    sample = tuple(str(tag) for tag in ordered_tags[:8])
+    return WheelSelection(
+        compatible,
+        tuple(incompatible),
+        tuple(sorted(selected)),
+        supported_tag_sample=sample,
+        errors=tuple(errors),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Installation
 # ---------------------------------------------------------------------------
 
 
-def _pip_available(python_executable, timeout=60.0):
+def _pip_available(python_executable, timeout=15.0):
     try:
         completed = subprocess.run(
             [python_executable, "-m", "pip", "--version"],
@@ -486,6 +828,115 @@ def _subprocess_flags():
     if platform.system() == "Windows":
         flags["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return flags
+
+
+def _emit_progress(callback, stage, message):
+    if callback is None:
+        return
+    try:
+        callback(stage, message)
+    except Exception:
+        logger.debug("Dependency progress callback failed", exc_info=True)
+
+
+def probe_package_imports(
+    python_executable,
+    packages=REQUIRED_PACKAGES,
+    search_paths=(),
+    timeout=DEFAULT_PACKAGE_PROBE_TIMEOUT_SECONDS,
+    progress=None,
+):
+    """Import each package in a disposable process with a hard timeout."""
+    script = (
+        "import importlib,json,sys;"
+        "from importlib import metadata;"
+        "name=sys.argv[1];"
+        "module=importlib.import_module(name);"
+        "\ntry: version=metadata.version(name)\n"
+        "except Exception: version=str(getattr(module,'__version__','') or '')\n"
+        "print(json.dumps({'version':version,'location':str(getattr(module,'__file__','') or '')}))"
+    )
+    environment = os.environ.copy()
+    ordered_paths = []
+    for entry in search_paths:
+        value = str(entry or "")
+        if value and value not in ordered_paths:
+            ordered_paths.append(value)
+    if ordered_paths:
+        existing = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = os.pathsep.join(
+            ordered_paths + ([existing] if existing else [])
+        )
+
+    statuses = []
+    for package in packages:
+        _emit_progress(progress, "package_probe", f"Checking import of {package}…")
+        try:
+            completed = subprocess.run(
+                [python_executable, "-c", script, package],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=environment,
+                **_subprocess_flags(),
+            )
+        except subprocess.TimeoutExpired:
+            statuses.append(
+                DependencyStatus(
+                    package,
+                    False,
+                    error=(
+                        f"Timeout while importing {package} after {timeout:.0f} s "
+                        f"in {python_executable}; the probe was stopped."
+                    ),
+                    verified=True,
+                )
+            )
+            continue
+        except Exception as e:
+            statuses.append(
+                DependencyStatus(
+                    package,
+                    False,
+                    error=f"Could not probe {package}: {type(e).__name__}: {e}",
+                    verified=True,
+                )
+            )
+            continue
+
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+            error = detail[-1][:1000] if detail else f"exit code {completed.returncode}"
+            if "No module named" in error:
+                error = ""
+            statuses.append(
+                DependencyStatus(package, False, error=error, verified=True)
+            )
+            continue
+        try:
+            data = json.loads((completed.stdout or "").strip().splitlines()[-1])
+            statuses.append(
+                DependencyStatus(
+                    package,
+                    True,
+                    version=str(data.get("version") or ""),
+                    location=str(data.get("location") or ""),
+                    verified=True,
+                )
+            )
+        except Exception as e:
+            statuses.append(
+                DependencyStatus(
+                    package,
+                    False,
+                    error=f"Import probe returned invalid data: {type(e).__name__}: {e}",
+                    verified=True,
+                )
+            )
+
+    statuses = tuple(statuses)
+    cache_dependency_statuses(statuses)
+    return statuses
 
 
 def _bootstrap_pip(python_executable, timeout):
@@ -515,7 +966,15 @@ def _write_constraints_file(directory):
     return str(path)
 
 
-def _install_command(python_executable, packages, target, wheel_dirs, constraints, trusted_hosts):
+def _install_command(
+    python_executable,
+    packages,
+    target,
+    wheel_dirs,
+    constraints,
+    trusted_hosts,
+    no_dependencies=False,
+):
     command = [
         python_executable,
         "-m",
@@ -527,6 +986,8 @@ def _install_command(python_executable, packages, target, wheel_dirs, constraint
         "--only-binary",
         ":all:",
     ]
+    if no_dependencies:
+        command.append("--no-deps")
     if target is not None and target.kind == "target":
         command.extend(["--target", target.path, "--upgrade"])
     if wheel_dirs:
@@ -539,6 +1000,25 @@ def _install_command(python_executable, packages, target, wheel_dirs, constraint
         command.extend(["--trusted-host", host])
     command.extend(_pip_requirement(package) for package in packages)
     return tuple(command)
+
+
+def _bundled_wheel_packages(wheels):
+    """Packages to install from a complete local wheel set, excluding Blender's.
+
+    Passing only ``matplotlib`` to pip asks it to resolve dependencies and put a
+    second numpy into the user target. Passing every bundled non-numpy package
+    with ``--no-deps`` installs the complete chart stack while keeping the
+    numpy that Blender owns.
+    """
+    return tuple(sorted({
+        _wheel_distribution_name(path)
+        for path in wheels
+        if _wheel_distribution_name(path) not in BUNDLED_PACKAGES
+    }))
+
+
+def _wheel_distribution_name(path):
+    return Path(path).name.split("-", 1)[0].replace("_", "-").lower()
 
 
 def _run_install(command, timeout):
@@ -576,25 +1056,108 @@ def install_required_packages(
     extra_wheel_directories=(),
     allow_online=True,
     trusted_hosts=(),
+    install_target=_AUTO_INSTALL_TARGET,
+    install_targets=(),
+    expected_runtime=None,
+    search_paths=(),
+    progress=None,
+    check_only=False,
 ):
-    """Install missing packages, preferring wheels bundled with the add-on."""
+    """Install missing packages after verifying runtime, target and wheels."""
     messages = []
     attempts = []
-    initial_missing = missing_packages(packages)
-    if not initial_missing:
+    python_executable = resolve_python_executable(python_executable)
+    _emit_progress(progress, "runtime", f"Checking Blender Python at {python_executable}…")
+    actual_runtime, runtime_error = probe_python_runtime(python_executable)
+    if runtime_error:
+        messages.append(runtime_error)
         return DependencyInstallResult(
-            True,
-            ("Dependencies already installed: " + ", ".join(packages),),
-            (),
+            False,
+            tuple(messages),
+            tuple(packages),
+            "\n".join(messages),
+            failed_stage="runtime detection",
+            error_source=runtime_error,
         )
 
-    python_executable = resolve_python_executable(python_executable)
-    messages.append(f"Python interpreter: {python_executable}")
+    mismatch = runtime_mismatch(expected_runtime, actual_runtime)
+    if mismatch:
+        error = (
+            f"Selected interpreter does not match Blender: {mismatch}. "
+            f"Selected executable: {python_executable}."
+        )
+        messages.append(error)
+        return DependencyInstallResult(
+            False,
+            tuple(messages),
+            tuple(packages),
+            "\n".join(messages),
+            failed_stage="runtime verification",
+            error_source=error,
+            runtime=actual_runtime.summary,
+        )
+    messages.append(f"Verified Python: {actual_runtime.summary}")
+    messages.append(f"Python executable actually used: {actual_runtime.executable}")
+    messages.append(f"Python prefix: {actual_runtime.prefix}")
 
-    target = choose_install_target()
+    if check_only:
+        _emit_progress(
+            progress,
+            "package_probe",
+            "Checking packages managed by Blender Extension…",
+        )
+        statuses = probe_package_imports(
+            python_executable,
+            packages,
+            search_paths=tuple(search_paths or sys.path),
+            progress=progress,
+        )
+        missing = tuple(status.name for status in statuses if not status.installed)
+        if not missing:
+            _emit_progress(progress, "done", "Extension chart packages are ready.")
+            return DependencyInstallResult(
+                True,
+                ("Blender Extension packages are installed and verified.",),
+                (),
+                source="existing",
+                runtime=actual_runtime.summary,
+            )
+        failed = next(status for status in statuses if not status.installed)
+        error = (
+            f"Blender Extension could not import {failed.name}"
+            + (f": {failed.error}" if failed.error else ".")
+            + " Reinstall or repair the Extension so Blender can restore its declared wheels."
+        )
+        messages.append(error)
+        return DependencyInstallResult(
+            False,
+            tuple(messages),
+            missing,
+            "\n".join(messages),
+            failed_stage=f"Extension package import: {failed.name}",
+            error_source=failed.error or error,
+            runtime=actual_runtime.summary,
+        )
+
+    _emit_progress(progress, "target", "Checking the package install directory…")
+    target_was_prepared = install_target is not _AUTO_INSTALL_TARGET
+    if install_targets:
+        target_options = tuple(install_targets)
+    elif target_was_prepared:
+        target_options = (install_target,) if install_target is not None else ()
+    else:
+        target_options = install_target_candidates()
+
+    checked_targets = []
+    target = None
+    for option in target_options:
+        checked = option if option.writable_checked else validate_install_target(option)
+        checked_targets.append(checked)
+        if target is None and checked.usable:
+            target = checked
     if target is None:
         problems = []
-        for candidate in install_target_candidates():
+        for candidate in checked_targets:
             reason = []
             if not candidate.writable:
                 reason.append("not writable")
@@ -603,20 +1166,87 @@ def install_required_packages(
                     f"path too long ({path_budget(candidate.path)} characters left of the Windows limit)"
                 )
             if not candidate.on_sys_path and candidate.kind != "interpreter":
-                reason.append("not on sys.path")
+                reason.append("will be added to sys.path")
             problems.append(f"{candidate.path}: {', '.join(reason) or 'unusable'}")
-        messages.append("No usable install directory. " + " | ".join(problems))
-        return DependencyInstallResult(False, tuple(messages), tuple(initial_missing), "\n".join(messages))
+        detail = " | ".join(problems)
+        error = "No usable install directory." + (f" {detail}" if detail else "")
+        messages.append(error)
+        return DependencyInstallResult(
+            False,
+            tuple(messages),
+            tuple(packages),
+            "\n".join(messages),
+            failed_stage="install directory verification",
+            error_source=error,
+            runtime=actual_runtime.summary,
+        )
 
     messages.append(f"Install directory: {target.path} ({target.note})")
+    _ensure_on_sys_path(target)
+    probe_paths = tuple(
+        dict.fromkeys((target.path, *tuple(search_paths or ()), *tuple(sys.path)))
+    )
 
+    _emit_progress(progress, "package_probe", "Checking currently installed chart packages…")
+    initial_statuses = probe_package_imports(
+        python_executable,
+        packages,
+        search_paths=probe_paths,
+        progress=progress,
+    )
+    initial_missing = tuple(status.name for status in initial_statuses if not status.installed)
+    if not initial_missing:
+        _emit_progress(progress, "done", "Chart packages are ready.")
+        return DependencyInstallResult(
+            True,
+            ("Dependencies already installed and verified: " + ", ".join(packages),),
+            (),
+            source="existing",
+            target=target.path,
+            runtime=actual_runtime.summary,
+        )
+
+    if any(package in BUNDLED_PACKAGES for package in initial_missing):
+        status = next(
+            status for status in initial_statuses
+            if status.name in BUNDLED_PACKAGES and not status.installed
+        )
+        error = (
+            f"Blender's bundled {status.name} could not be imported"
+            + (f": {status.error}" if status.error else ".")
+            + " ScientiaJoints will not install a second binary copy."
+        )
+        messages.append(error)
+        return DependencyInstallResult(
+            False,
+            tuple(messages),
+            initial_missing,
+            "\n".join(messages),
+            failed_stage=f"importing {status.name}",
+            error_source=status.error or error,
+            target=target.path,
+            runtime=actual_runtime.summary,
+        )
+
+    _emit_progress(progress, "pip", "Checking pip in Blender Python…")
     pip_ok, pip_message = _pip_available(python_executable)
     if not pip_ok:
         messages.append(f"pip is not available ({pip_message}); bootstrapping it.")
-        bootstrapped, bootstrap_log = _bootstrap_pip(python_executable, timeout)
+        _emit_progress(progress, "pip_bootstrap", "Preparing pip in Blender Python…")
+        bootstrapped, bootstrap_log = _bootstrap_pip(python_executable, min(timeout, 60.0))
         if not bootstrapped:
-            messages.append(f"Failed to bootstrap pip: {bootstrap_log.strip()[-500:]}")
-            return DependencyInstallResult(False, tuple(messages), tuple(initial_missing), "\n".join(messages))
+            error = f"Failed to bootstrap pip: {bootstrap_log.strip()[-500:]}"
+            messages.append(error)
+            return DependencyInstallResult(
+                False,
+                tuple(messages),
+                initial_missing,
+                "\n".join(messages),
+                failed_stage="pip bootstrap",
+                error_source=error,
+                target=target.path,
+                runtime=actual_runtime.summary,
+            )
         messages.append("pip bootstrapped.")
     else:
         messages.append(f"pip: {pip_message}")
@@ -632,22 +1262,99 @@ def install_required_packages(
         sources = []
         wheels = available_wheels(extra_wheel_directories)
         if wheels:
-            sources.append(("bundled wheels", wheel_directories(extra_wheel_directories), ()))
-            messages.append(f"Found {len(wheels)} bundled wheel(s) in {', '.join(wheel_directories(extra_wheel_directories))}")
+            _emit_progress(
+                progress,
+                "wheel_selection",
+                f"Selecting offline wheels for {actual_runtime.cache_tag or actual_runtime.version_text}…",
+            )
+            selection = select_compatible_wheels(wheels)
+            compatible_non_numpy = tuple(
+                path for path in selection.compatible
+                if _wheel_distribution_name(path) not in BUNDLED_PACKAGES
+            )
+            required_offline = {
+                _pip_name(name).replace("_", "-").lower()
+                for name in initial_missing
+                if name not in BUNDLED_PACKAGES
+            }
+            available_offline = {
+                _wheel_distribution_name(path) for path in compatible_non_numpy
+            }
+            absent = sorted(required_offline - available_offline)
+            messages.append(
+                f"Offline wheel selection: {len(selection.compatible)} compatible, "
+                f"{len(selection.incompatible)} incompatible for "
+                f"{actual_runtime.cache_tag or actual_runtime.version_text}."
+            )
+            if selection.supported_tag_sample:
+                messages.append("Supported wheel tags include: " + ", ".join(selection.supported_tag_sample[:4]))
+            if selection.errors:
+                messages.extend(selection.errors)
+            if compatible_non_numpy and not absent:
+                sources.append((
+                    "bundled wheels",
+                    wheel_directories(extra_wheel_directories),
+                    (),
+                    compatible_non_numpy,
+                    True,
+                    min(timeout, DEFAULT_OFFLINE_PIP_TIMEOUT_SECONDS),
+                    selection,
+                ))
+            else:
+                detail = ", ".join(absent) if absent else "no compatible chart wheels"
+                messages.append(
+                    f"Bundled wheels cannot satisfy this Python ({detail}); "
+                    "incompatible files will not be passed to pip."
+                )
         if allow_online:
-            sources.append(("PyPI", (), ()))
+            sources.append(("PyPI", (), (), initial_missing, False, timeout, None))
             if trusted_hosts:
-                sources.append(("PyPI without certificate verification", (), tuple(trusted_hosts)))
+                sources.append((
+                    "PyPI without certificate verification",
+                    (),
+                    tuple(trusted_hosts),
+                    initial_missing,
+                    False,
+                    timeout,
+                    None,
+                ))
 
         if not sources:
-            messages.append("No installation source available: no bundled wheels and online installation is disabled.")
-            return DependencyInstallResult(False, tuple(messages), tuple(initial_missing), "\n".join(messages))
+            error = (
+                "No compatible installation source is available: the bundled wheels do not "
+                "match this Python and online installation is disabled."
+            )
+            messages.append(error)
+            return DependencyInstallResult(
+                False,
+                tuple(messages),
+                initial_missing,
+                "\n".join(messages),
+                failed_stage="offline wheel selection",
+                error_source=error,
+                target=target.path,
+                runtime=actual_runtime.summary,
+            )
 
         used_source = ""
-        for source_name, wheel_dirs, hosts in sources:
+        used_selection = None
+        for (
+            source_name,
+            wheel_dirs,
+            hosts,
+            source_packages,
+            no_dependencies,
+            source_timeout,
+            source_selection,
+        ) in sources:
+            _emit_progress(
+                progress,
+                "pip_install",
+                f"Installing chart packages from {source_name}; please wait…",
+            )
             command = _install_command(
                 python_executable,
-                initial_missing,
+                source_packages,
                 target,
                 wheel_dirs,
                 # An offline install resolves against the wheel directory,
@@ -655,9 +1362,10 @@ def install_required_packages(
                 # creates unsatisfiable requirements.
                 "" if wheel_dirs else constraints,
                 hosts,
+                no_dependencies=no_dependencies,
             )
             logger.info("Installing %s from %s", ", ".join(initial_missing), source_name)
-            attempt = _run_install(command, timeout)
+            attempt = _run_install(command, source_timeout)
             attempt = InstallAttempt(
                 source=source_name,
                 command=attempt.command,
@@ -668,6 +1376,7 @@ def install_required_packages(
             attempts.append(attempt)
             if attempt.returncode == 0:
                 used_source = source_name
+                used_selection = source_selection
                 messages.append(f"pip install from {source_name} finished successfully.")
                 break
             messages.append(
@@ -679,13 +1388,21 @@ def install_required_packages(
     _ensure_on_sys_path(target)
     _drop_failed_imports(initial_missing)
 
-    missing = missing_packages(packages)
+    _emit_progress(progress, "verification", "Verifying installed packages in Blender Python…")
+    final_statuses = probe_package_imports(
+        python_executable,
+        packages,
+        search_paths=probe_paths,
+        progress=progress,
+    )
+    missing = tuple(status.name for status in final_statuses if not status.installed)
     if missing:
         messages.append("Still missing after installation: " + ", ".join(missing))
-        for hint in installation_hints(missing, target, attempts):
+        for hint in installation_hints(missing, target, attempts, statuses=final_statuses):
             messages.append(hint)
     else:
         messages.append("Dependencies are available: " + ", ".join(packages))
+        _emit_progress(progress, "done", "Installation finished. Chart packages are ready.")
 
     log_parts = []
     for attempt in attempts:
@@ -693,6 +1410,14 @@ def install_required_packages(
         log_parts.append(attempt.output.strip())
         log_parts.append(attempt.error.strip())
     log = "\n".join(part for part in log_parts if part)
+    failed_status = next((status for status in final_statuses if not status.installed), None)
+    failed_stage = f"importing {failed_status.name}" if failed_status is not None else ""
+    error_source = failed_status.error if failed_status is not None else ""
+    if missing and attempts and not used_source:
+        failed_stage = f"pip install from {attempts[-1].source}"
+        error_source = _summarize_pip_failure(attempts[-1])
+    elif missing and not error_source and attempts:
+        error_source = _summarize_pip_failure(attempts[-1])
 
     return DependencyInstallResult(
         not missing,
@@ -702,6 +1427,10 @@ def install_required_packages(
         tuple(attempts),
         source=used_source,
         target=target.path,
+        failed_stage=failed_stage,
+        error_source=error_source,
+        runtime=actual_runtime.summary,
+        compatible_wheels=tuple(used_selection.compatible) if used_selection else (),
     )
 
 
@@ -709,8 +1438,41 @@ def _ensure_on_sys_path(target):
     if target is None:
         return
     absolute = str(Path(target.path).absolute())
-    if os.path.normcase(absolute) not in _sys_path_set():
+    normalized = os.path.normcase(absolute)
+    existing = [
+        entry for entry in sys.path
+        if entry and os.path.normcase(os.path.abspath(entry)) == normalized
+    ]
+    for entry in existing:
+        sys.path.remove(entry)
+    # A managed user target must win over stale copies elsewhere. numpy is
+    # never installed there, so Blender's binary package remains authoritative.
+    if target.kind == "target":
+        sys.path.insert(0, absolute)
+    else:
         sys.path.append(absolute)
+
+
+def prepare_background_install():
+    """Capture Blender-owned paths quickly; validate I/O on the worker."""
+    runtime = current_python_runtime()
+    if installed_as_extension():
+        return {
+            "python_executable": runtime.executable,
+            "expected_runtime": runtime,
+            "search_paths": tuple(sys.path),
+            "check_only": True,
+        }
+    targets = install_target_candidates(probe_writable=False)
+    target = next((candidate for candidate in targets if candidate.usable), None)
+    _ensure_on_sys_path(target)
+    return {
+        "python_executable": resolve_python_executable(),
+        "install_target": target,
+        "install_targets": targets,
+        "expected_runtime": runtime,
+        "search_paths": tuple(sys.path),
+    }
 
 
 def _drop_failed_imports(packages):
@@ -745,7 +1507,7 @@ def _summarize_pip_failure(attempt):
     return tail[-1][:300] if tail else "see the diagnostics report for the full pip log."
 
 
-def installation_hints(missing, target=None, attempts=()):
+def installation_hints(missing, target=None, attempts=(), statuses=None):
     """Human readable causes and next steps for a failed installation."""
     hints = []
     target = target or choose_install_target()
@@ -759,8 +1521,14 @@ def installation_hints(missing, target=None, attempts=()):
                 "Move the Blender configuration to a shorter path or install the extension build."
             )
 
-    statuses = {status.name: status for status in check_required_packages(missing)}
-    for name, status in statuses.items():
+    status_map = {
+        status.name: status
+        for status in (
+            statuses if statuses is not None else safe_dependency_statuses(missing)
+        )
+        if status.name in missing
+    }
+    for name, status in status_map.items():
         if "numpy.dtype size changed" in status.error or "binary incompatibility" in status.error.lower():
             hints.append(
                 f"{name} was built against a different numpy than the one Blender bundles. "
@@ -822,6 +1590,10 @@ def should_attempt_automatic_install(packages=REQUIRED_PACKAGES, now=None):
     if not missing_packages(packages):
         return False
     state = read_install_state()
+    if state.get("fingerprint") != automatic_install_fingerprint(packages):
+        # A new add-on build, Python, wheel set, or corrected install policy
+        # deserves one immediate attempt even if an older build just failed.
+        return True
     last = float(state.get("last_attempt", 0.0) or 0.0)
     if not last:
         return True
@@ -836,7 +1608,38 @@ def record_install_attempt(result, now=None):
     state["missing"] = list(getattr(result, "missing_after_install", ()) or ())
     state["source"] = str(getattr(result, "source", "") or "")
     state["target"] = str(getattr(result, "target", "") or "")
+    state["runtime"] = str(getattr(result, "runtime", "") or "")
+    state["failed_stage"] = str(getattr(result, "failed_stage", "") or "")
+    state["error_source"] = str(getattr(result, "error_source", "") or "")
+    state["fingerprint"] = automatic_install_fingerprint()
     write_install_state(state)
+
+
+def automatic_install_fingerprint(packages=REQUIRED_PACKAGES):
+    """Stable identity of the environment covered by one failed attempt."""
+    try:
+        target = choose_install_target(probe_writable=False)
+        target_path = target.path if target is not None else ""
+    except Exception:
+        target_path = ""
+    wheels = []
+    for path in available_wheels():
+        try:
+            wheel_path = Path(path)
+            wheels.append((wheel_path.name, wheel_path.stat().st_size))
+        except OSError:
+            wheels.append((Path(path).name, -1))
+    payload = {
+        "policy": INSTALL_POLICY_VERSION,
+        "packages": [_pip_requirement(package) for package in packages],
+        "python": list(sys.version_info[:3]),
+        "executable": resolve_python_executable(),
+        "addon": str(Path(__file__).resolve().parent),
+        "target": target_path,
+        "wheels": sorted(wheels),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class BackgroundInstall:
@@ -854,12 +1657,16 @@ class BackgroundInstall:
         self._result = None
         self._started_at = 0.0
         self._lock = threading.Lock()
+        self._stage = "queued"
+        self._message = "Waiting to start…"
 
     def start(self):
         if self.running:
             return False
         self._result = None
         self._started_at = time.monotonic()
+        self._stage = "starting"
+        self._message = "Starting dependency check…"
         self._thread = threading.Thread(
             target=self._run,
             name="ScientiaJoints-dependency-install",
@@ -870,12 +1677,46 @@ class BackgroundInstall:
 
     def _run(self):
         try:
-            result = install_required_packages(self.packages, **self.kwargs)
+            caller_progress = self.kwargs.pop("progress", None)
+
+            def progress(stage, message):
+                with self._lock:
+                    self._stage = str(stage)
+                    self._message = str(message)
+                if caller_progress is not None:
+                    caller_progress(stage, message)
+
+            result = install_required_packages(
+                self.packages,
+                progress=progress,
+                **self.kwargs,
+            )
         except Exception as e:  # pragma: no cover - defensive
             logger.exception("Dependency installation crashed")
-            result = DependencyInstallResult(False, (f"Installation crashed: {e}",), self.packages)
+            with self._lock:
+                failed_stage = self._stage
+            result = DependencyInstallResult(
+                False,
+                (f"Installation crashed at {failed_stage}: {e}",),
+                self.packages,
+                failed_stage=failed_stage,
+                error_source=f"{type(e).__name__}: {e}",
+            )
         with self._lock:
             self._result = result
+            if result.ok:
+                self._stage = "done"
+                self._message = (
+                    "Dependency check finished."
+                    if result.source == "existing"
+                    else "Installation finished. Chart packages are ready."
+                )
+            else:
+                self._stage = result.failed_stage or self._stage or "failed"
+                self._message = (
+                    f"Stopped at {self._stage}: "
+                    f"{result.error_source or 'see diagnostics for details'}"
+                )
 
     @property
     def running(self):
@@ -888,3 +1729,11 @@ class BackgroundInstall:
     def result(self):
         with self._lock:
             return self._result
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "stage": self._stage,
+                "message": self._message,
+                "elapsed": self.elapsed,
+            }

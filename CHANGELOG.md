@@ -22,6 +22,17 @@ All notable changes to ScientiaJoints are documented here.
 - Every collapsible sidebar section now carries an icon next to its disclosure triangle, so a collapsed panel is still scannable, and the export and statistics rows are labelled by kind rather than by file format alone.
 - The three tools no longer each draw their own copy of the tool header settings, which is how they came to offer different toggles.
 
+### Fixed
+
+- Trace visibility now invalidates both overlay caches, and the global toggle also filters the active and hovered measurement. Switching all traces off therefore removes lines, handles, and labels immediately instead of leaving stale or selected traces behind.
+- Moving a trace point no longer reclassifies it from its point count. The ordinary linear/plane tool and the polygon tool only edit the kinds they understand; the trace tool keeps an edited trace open and keeps it in trace export.
+- Trace labels now show the straight 3D end-to-end distance as a separate, configurable field. `Measurement Info` dispatches by the stored trace kind, including two-point traces, and the processed CSV continues to export the value as `span_length`.
+- Opening diagnostics no longer runs matplotlib rendering on Blender's UI thread. The extended self-test is opt-in, and dependency imports are paused while the legacy installer is writing packages.
+- The legacy archive now prepares Blender's per-user `scripts/modules` target before starting its worker and installs the complete bundled non-numpy wheel set with `--no-deps`. It no longer depends on an enabled Extension copy to expose matplotlib, and it cannot shadow Blender's numpy. Release validation refuses archives missing the chart wheels.
+- Dependency setup now verifies the actual Blender Python executable, minor version, ABI and bitness before pip starts, selects only offline wheels compatible with that runtime, and checks the active Blender profile's install target on the worker. The Extension build is verification-only and never borrows the legacy target, so either installation works on its own.
+- Dependency detection, imports, pip and chart self-tests are timeout-protected background stages. The panel shows the current stage and elapsed time, keeps an explicit success message after installation, and reports the exact stage and underlying error when work stops.
+- Diagnostics now opens as a popup without the ambiguous `OK`/`Cancel` pair. It shows seven clearly named installation-risk values, an explicit `Start Full Check` action, and a live completed/total count. Cached modules are reloaded before testing so an in-place update cannot pair a new operator with an old diagnostics module; an actually mixed installation reports a clean-reinstall action instead of crashing a worker thread. matplotlib and mplstereonet rendering checks run in disposable child processes.
+
 ## [Unreleased]
 
 ### Changed

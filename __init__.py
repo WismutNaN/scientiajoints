@@ -4,7 +4,7 @@
 bl_info = {
     "name": "ScientiaJoints",
     "author": "Scientia, Ivan Guzeev",
-    "version": (3, 4, 3),
+    "version": (3, 4, 7),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > ScientiaJoints",
     "description": "Export measurements with visualizations and adjustable settings",
@@ -233,8 +233,8 @@ def _schedule_dependency_install():
         try:
             from . import operators
 
-            if not dependencies.should_attempt_automatic_install():
-                missing = dependencies.missing_packages()
+            missing = dependencies.missing_packages()
+            if missing and not dependencies.should_attempt_automatic_install():
                 if missing:
                     logger.warning(
                         "ScientiaJoints chart packages are missing (%s). An automatic install was "
@@ -242,6 +242,9 @@ def _schedule_dependency_install():
                         ", ".join(missing),
                     )
                 return None
+            # Even when every module is discoverable, verify imports in
+            # timeout-protected child processes. This catches an incompatible
+            # binary wheel without importing it on Blender's UI thread.
             operators.start_dependency_install(automatic=True)
         except Exception as e:
             logger.warning("Could not start the automatic dependency install: %s", e, exc_info=True)
@@ -433,6 +436,7 @@ def register():
             RealTimeTracesUpdateOperator,
             ScientiaDiagnosticsCopyOperator,
             ScientiaDiagnosticsOperator,
+            ScientiaDiagnosticsRunTestsOperator,
             ScientiaDiagnosticsSaveOperator,
             ScientiaInstallDependenciesOperator,
             ToggleLightSettingsOperator,
@@ -596,6 +600,7 @@ def register():
             ToggleLightSettingsOperator,
             ScientiaInstallDependenciesOperator,
             ScientiaDiagnosticsOperator,
+            ScientiaDiagnosticsRunTestsOperator,
             ScientiaDiagnosticsCopyOperator,
             ScientiaDiagnosticsSaveOperator,
             ScientiaAssignCodeOperator,

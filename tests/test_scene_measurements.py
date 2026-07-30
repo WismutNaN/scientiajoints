@@ -63,6 +63,49 @@ class SceneMeasurementTests(unittest.TestCase):
 
         self.assertEqual([item.name for item in codes], ["J3"])
 
+    def _measurement(self, kind):
+        return types.SimpleNamespace(
+            kind=kind,
+            points=FakeCollection(lambda: types.SimpleNamespace(co=(0.0, 0.0, 0.0))),
+        )
+
+    def test_coordinate_edits_preserve_every_compatible_semantic_kind(self):
+        cases = (
+            ("LINEAR", ((0, 0, 0), (1, 0, 0))),
+            ("PLANE", ((0, 0, 0), (1, 0, 0), (0, 1, 0))),
+            ("POLYLINE", ((0, 0, 0), (1, 0, 0), (0, 1, 0))),
+            ("TRACE", ((0, 0, 0), (1, 0, 0))),
+            ("TRACE", ((0, 0, 0), (1, 0, 0), (2, 1, 0))),
+            ("TRACE", ((0, 0, 0), (1, 0, 0), (2, 1, 0), (3, 0, 0))),
+        )
+
+        for kind, points in cases:
+            with self.subTest(kind=kind, point_count=len(points)):
+                measurement = self._measurement(kind)
+                self.scene_measurements.set_scene_measurement_points(measurement, points)
+                self.assertEqual(measurement.kind, kind)
+
+    def test_a_real_topology_change_can_still_reclassify_a_linear_measurement(self):
+        measurement = self._measurement("LINEAR")
+
+        self.scene_measurements.set_scene_measurement_points(
+            measurement,
+            ((0, 0, 0), (1, 0, 0), (0, 1, 0)),
+        )
+
+        self.assertEqual(measurement.kind, "PLANE")
+
+    def test_an_explicit_kind_override_takes_priority(self):
+        measurement = self._measurement("TRACE")
+
+        self.scene_measurements.set_scene_measurement_points(
+            measurement,
+            ((0, 0, 0), (1, 0, 0), (0, 1, 0)),
+            kind="POLYLINE",
+        )
+
+        self.assertEqual(measurement.kind, "POLYLINE")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ produced when the add-on is partially broken.
 import logging
 import os
 import platform
+import subprocess
 import sys
 import tempfile
 import time
@@ -42,6 +43,7 @@ class Report:
     sections: list = field(default_factory=list)
     checks: list = field(default_factory=list)
     problems: list = field(default_factory=list)
+    highlights: list = field(default_factory=list)
 
     def add(self, title, lines):
         self.sections.append((title, [line for line in lines if line is not None]))
@@ -49,6 +51,9 @@ class Report:
     @property
     def ok(self):
         return not any(problem.severity == "error" for problem in self.problems)
+
+
+SELF_TEST_COUNT = 6
 
 
 def _safe(getter, default="unavailable"):
@@ -85,8 +90,65 @@ def _install_flavour():
     """Legacy add-on directory or Blender extension."""
     package = __package__ or ""
     if package.startswith("bl_ext."):
-        return f"extension ({package})"
-    return f"legacy add-on ({package or 'unknown package'})"
+        return f"Extension — packages managed by Blender ({package})"
+    return f"Legacy add-on — bundled offline installer ({package or 'unknown package'})"
+
+
+def _top_risk_parameters(context=None):
+    """Seven concise values most useful for diagnosing install failures."""
+    import bpy
+
+    runtime = deps.current_python_runtime()
+    statuses = deps.safe_dependency_statuses()
+    missing = [status.name for status in statuses if not status.installed]
+    broken = [status.name for status in statuses if status.error]
+    verified = sum(1 for status in statuses if status.verified and status.installed)
+    target = None if deps.installed_as_extension() else deps.choose_install_target(probe_writable=False)
+    wheels = deps.available_wheels()
+    selection = deps.select_compatible_wheels(wheels)
+
+    if broken:
+        package_value = "Import failed: " + ", ".join(broken)
+        package_level = "error"
+    elif missing:
+        package_value = "Missing: " + ", ".join(missing)
+        package_level = "error"
+    elif verified == len(statuses):
+        package_value = f"Ready — all {verified} libraries verified"
+        package_level = "ok"
+    else:
+        package_value = f"Found — {verified} of {len(statuses)} verified in the background"
+        package_level = "info"
+
+    wheel_level = "ok" if selection.compatible else "warning"
+    wheel_value = (
+        f"{len(selection.compatible)} suitable, "
+        f"{len(selection.incompatible)} ignored for this Python"
+    )
+    if selection.errors:
+        wheel_value += "; tag detection warning"
+
+    return [
+        ("Blender version", str(getattr(bpy.app, "version_string", "unknown")), "info"),
+        ("Installation type", _install_flavour(), "info"),
+        ("Python used by Blender", runtime.summary, "ok"),
+        (
+            "Python used for package setup",
+            runtime.executable or "not resolved",
+            "ok" if runtime.executable else "error",
+        ),
+        (
+            "Package install location",
+            (
+                "managed by Blender Extension"
+                if deps.installed_as_extension()
+                else (target.path if target else "no candidate")
+            ),
+            "info" if target or deps.installed_as_extension() else "error",
+        ),
+        ("Chart libraries", package_value, package_level),
+        ("Offline installer files", wheel_value, wheel_level),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -120,11 +182,15 @@ def _blender_section():
 
 
 def _environment_section():
+    runtime = deps.current_python_runtime()
     lines = [
         f"OS: {platform.platform()}",
         f"Machine: {platform.machine()}, CPU cores {os.cpu_count()}",
-        f"Python: {sys.version.split()[0]} ({sys.executable})",
-        f"Resolved interpreter for pip: {deps.resolve_python_executable()}",
+        f"Active Python runtime: {runtime.summary}",
+        f"sys.executable: {sys.executable}",
+        f"Resolved interpreter for pip: {runtime.executable}",
+        f"Python prefix: {runtime.prefix}",
+        f"Python exec_prefix: {runtime.exec_prefix}",
     ]
     try:
         import gpu
@@ -144,14 +210,19 @@ def _environment_section():
 
 def _dependency_section(problems):
     lines = []
-    too_old = {name: required for name, _, required in deps.outdated_packages()}
-    for status in deps.check_required_packages():
+    statuses = deps.safe_dependency_statuses()
+    too_old = {
+        name: required
+        for name, _, required in deps.outdated_packages(statuses=statuses)
+    }
+    for status in statuses:
         if status.installed and status.name in too_old:
             lines.append(f"{status.name}: TOO OLD {status.version} (need {too_old[status.name]})")
             lines.append(f"  installed by: {deps.package_install_method(status)}")
             lines.append(f"  file: {status.location}")
         elif status.installed:
-            lines.append(f"{status.name}: OK {status.version or ''}".rstrip())
+            state = "OK" if status.verified else "FOUND (background import check pending)"
+            lines.append(f"{status.name}: {state} {status.version or ''}".rstrip())
             lines.append(f"  installed by: {deps.package_install_method(status)}")
             lines.append(f"  file: {status.location}")
         elif status.error:
@@ -161,21 +232,37 @@ def _dependency_section(problems):
 
     lines.append("")
     lines.append("Install directories:")
-    for candidate in deps.install_target_candidates():
-        remaining = deps.path_budget(candidate.path)
-        flags = []
-        flags.append("writable" if candidate.writable else "READ-ONLY")
-        flags.append("on sys.path" if candidate.on_sys_path else "NOT on sys.path")
-        flags.append(f"{remaining} chars left of the Windows path limit")
-        lines.append(f"  {candidate.path} [{', '.join(flags)}]")
+    if deps.installed_as_extension():
+        lines.append("  managed by Blender Extension from blender_manifest.toml")
+    else:
+        for candidate in deps.install_target_candidates(probe_writable=False):
+            remaining = deps.path_budget(candidate.path)
+            flags = []
+            flags.append("writability is checked by the background installer")
+            flags.append("on sys.path" if candidate.on_sys_path else "NOT on sys.path")
+            flags.append(f"{remaining} chars left of the Windows path limit")
+            lines.append(f"  {candidate.path} [{', '.join(flags)}]")
 
     wheels = deps.available_wheels()
-    lines.append(f"Bundled wheels: {len(wheels)} in {deps.addon_wheels_directory()}")
-    for wheel in wheels[:20]:
+    selection = deps.select_compatible_wheels(wheels)
+    lines.append(
+        f"Bundled wheels: {len(wheels)} total, {len(selection.compatible)} compatible, "
+        f"{len(selection.incompatible)} skipped in {deps.addon_wheels_directory()}"
+    )
+    if selection.supported_tag_sample:
+        lines.append("Current Python wheel tags: " + ", ".join(selection.supported_tag_sample[:4]))
+    for wheel in selection.compatible[:20]:
         lines.append(f"  {Path(wheel).name}")
 
-    target = deps.choose_install_target()
-    lines.append(f"Directory the add-on would install into: {target.path if target else 'none usable'}")
+    target = None if deps.installed_as_extension() else deps.choose_install_target(probe_writable=False)
+    lines.append(
+        "Directory the add-on would install into: "
+        + (
+            "managed by Blender Extension"
+            if deps.installed_as_extension()
+            else (target.path if target else "none usable")
+        )
+    )
 
     state = deps.read_install_state()
     if state.get("last_attempt"):
@@ -185,19 +272,48 @@ def _dependency_section(problems):
             lines.append(f"  source used: {state['source']}")
         if state.get("target"):
             lines.append(f"  installed into: {state['target']}")
+        if state.get("runtime"):
+            lines.append(f"  verified runtime: {state['runtime']}")
+        if state.get("failed_stage"):
+            lines.append(f"  failed stage: {state['failed_stage']}")
+        if state.get("error_source"):
+            lines.append(f"  error source: {state['error_source']}")
         if state.get("missing"):
             lines.append(f"  still missing: {', '.join(state['missing'])}")
     else:
         lines.append("Last install run by the add-on: never")
 
-    _collect_dependency_problems(problems)
+    _collect_dependency_problems(problems, statuses=statuses)
     return lines
 
 
-def _collect_dependency_problems(problems):
-    statuses = deps.check_required_packages()
+def _dependency_installing_section(problems):
+    """Dependency report used while pip owns the target directory.
 
-    for name, installed, required in deps.outdated_packages():
+    Importing a package while another thread is replacing its files can block
+    on Python's import lock or observe a half-installed package. The status is
+    therefore intentionally reported without probing matplotlib until the
+    background job has finished.
+    """
+    problems.append(
+        Problem(
+            "info",
+            "Chart package installation is still running",
+            cause="The legacy add-on is installing its bundled wheels in the background.",
+            action="Keep working in Blender and reopen diagnostics after the panel reports completion.",
+        )
+    )
+    return [
+        "Installation: RUNNING",
+        "Package imports and chart self-tests are temporarily skipped.",
+        f"Bundled wheels: {len(deps.available_wheels())} in {deps.addon_wheels_directory()}",
+    ]
+
+
+def _collect_dependency_problems(problems, statuses=None):
+    statuses = tuple(statuses if statuses is not None else deps.safe_dependency_statuses())
+
+    for name, installed, required in deps.outdated_packages(statuses=statuses):
         problems.append(
             Problem(
                 "warning",
@@ -222,8 +338,12 @@ def _collect_dependency_problems(problems):
                     f"{status.name} is not installed",
                     cause="The package was never installed into Blender's Python, or the install "
                           "directory is not on sys.path.",
-                    action="Press Install dependencies in the ScientiaJoints panel, or install the "
-                           "extension build that carries the packages inside the archive.",
+                    action=(
+                        "Repair or reinstall the Extension so Blender restores its declared wheels."
+                        if deps.installed_as_extension()
+                        else "Press Install dependencies in the ScientiaJoints panel, or install the "
+                             "extension build that carries the packages inside the archive."
+                    ),
                 )
             )
             continue
@@ -259,7 +379,9 @@ def _collect_dependency_problems(problems):
                 )
             )
 
-    target = deps.choose_install_target()
+    if deps.installed_as_extension():
+        return
+    target = deps.choose_install_target(probe_writable=False)
     if target is None:
         problems.append(
             Problem(
@@ -462,14 +584,40 @@ def _collect_measurement_problems(parser, problems):
 
 
 def run_self_tests():
-    checks = []
-    checks.append(_check_geometry())
-    checks.append(_check_deduplication())
-    checks.append(_check_export_roundtrip())
-    checks.append(_check_matplotlib())
-    checks.append(_check_stereonet())
-    checks.append(_check_overlay())
-    return [check for check in checks if check is not None]
+    return [
+        check for _name, checker in self_test_cases(include_overlay=True)
+        for check in (checker(),)
+        if check is not None
+    ]
+
+
+def self_test_cases(include_overlay=True):
+    cases = [
+        ("Plane orientation math", _check_geometry),
+        ("Duplicate protection", _check_deduplication),
+        ("CSV export", _check_export_roundtrip),
+        ("matplotlib rendering", _check_matplotlib),
+        ("mplstereonet projection", _check_stereonet),
+    ]
+    if include_overlay:
+        cases.append(("Viewport overlay and panel", _check_overlay))
+    return tuple(cases)
+
+
+def add_self_test_results(report, checks):
+    report.checks = list(checks)
+    for check in report.checks:
+        if check.passed or check.skipped:
+            continue
+        report.problems.append(
+            Problem(
+                "error",
+                f"Self-test failed: {check.name}",
+                cause=check.detail,
+                action="Include this report when asking for support.",
+            )
+        )
+    return report
 
 
 def _check_geometry():
@@ -550,40 +698,67 @@ def _check_export_roundtrip():
 
 
 def _check_matplotlib():
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg", force=True)
-        import matplotlib.pyplot as plt
-
-        figure = plt.figure(figsize=(1, 1))
-        figure.add_subplot(111).plot([0, 1], [0, 1])
-        directory = tempfile.mkdtemp(prefix="scientia-selftest-")
-        path = Path(directory) / "selftest.png"
-        figure.savefig(str(path))
-        plt.close(figure)
-        size = path.stat().st_size
-        path.unlink(missing_ok=True)
-        Path(directory).rmdir()
-        return CheckResult("matplotlib rendering", size > 0, f"{matplotlib.__version__}, wrote {size} bytes")
-    except Exception as e:
-        return CheckResult("matplotlib rendering", False, f"{type(e).__name__}: {e}")
+    script = """
+import pathlib
+import tempfile
+import matplotlib
+matplotlib.use("Agg", force=True)
+import matplotlib.pyplot as plt
+figure = plt.figure(figsize=(1, 1))
+figure.add_subplot(111).plot([0, 1], [0, 1])
+path = pathlib.Path(tempfile.gettempdir()) / "scientiajoints-selftest-matplotlib.png"
+figure.savefig(str(path))
+plt.close(figure)
+size = path.stat().st_size
+path.unlink(missing_ok=True)
+print(f"{matplotlib.__version__}, wrote {size} bytes")
+"""
+    return _run_isolated_python_check("matplotlib rendering", script)
 
 
 def _check_stereonet():
+    script = """
+import matplotlib
+matplotlib.use("Agg", force=True)
+import matplotlib.pyplot as plt
+import mplstereonet
+figure, axes = mplstereonet.subplots(figsize=(1, 1))
+axes.pole([0.0], [45.0])
+plt.close(figure)
+print("a pole was projected successfully")
+"""
+    return _run_isolated_python_check("mplstereonet projection", script)
+
+
+def _run_isolated_python_check(name, script, timeout=45.0):
+    """Run a chart test outside Blender and stop it if it hangs."""
+    environment = os.environ.copy()
+    paths = [str(entry) for entry in sys.path if entry]
+    existing = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = os.pathsep.join(paths + ([existing] if existing else []))
     try:
-        import matplotlib
-
-        matplotlib.use("Agg", force=True)
-        import matplotlib.pyplot as plt
-        import mplstereonet
-
-        figure, axes = mplstereonet.subplots(figsize=(1, 1))
-        axes.pole([0.0], [45.0])
-        plt.close(figure)
-        return CheckResult("mplstereonet projection", True, "a pole was projected successfully")
+        completed = subprocess.run(
+            [deps.resolve_python_executable(), "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=environment,
+            **deps._subprocess_flags(),
+        )
+    except subprocess.TimeoutExpired:
+        return CheckResult(
+            name,
+            False,
+            f"Timed out after {timeout:.0f} s while running {name}; the child process was stopped.",
+        )
     except Exception as e:
-        return CheckResult("mplstereonet projection", False, f"{type(e).__name__}: {e}")
+        return CheckResult(name, False, f"{type(e).__name__}: {e}")
+    output = (completed.stdout or "").strip().splitlines()
+    error = (completed.stderr or "").strip().splitlines()
+    if completed.returncode == 0:
+        return CheckResult(name, True, output[-1] if output else "completed")
+    detail = error[-1] if error else (output[-1] if output else f"exit code {completed.returncode}")
+    return CheckResult(name, False, detail[:1000])
 
 
 def _check_overlay():
@@ -608,32 +783,31 @@ def _check_overlay():
 # ---------------------------------------------------------------------------
 
 
-def build_report(context=None, run_tests=True):
+def build_report(context=None, run_tests=True, dependency_installing=False):
     import bpy
 
     context = context or bpy.context
     report = Report()
     problems = report.problems
+    try:
+        report.highlights = _top_risk_parameters(context)
+    except Exception:
+        logger.debug("Top diagnostics parameters are unavailable", exc_info=True)
+        report.highlights = []
 
     report.add("Blender", _safe_lines(_blender_section))
     report.add("Environment", _safe_lines(_environment_section))
-    report.add("Dependencies", _safe_lines(lambda: _dependency_section(problems)))
+    dependency_getter = (
+        lambda: _dependency_installing_section(problems)
+        if dependency_installing
+        else _dependency_section(problems)
+    )
+    report.add("Dependencies", _safe_lines(dependency_getter))
     report.add("File", _safe_lines(lambda: _file_section(context, problems)))
     report.add("Measurements", _safe_lines(lambda: _measurement_section(context, problems)))
 
-    if run_tests:
-        report.checks = run_self_tests()
-        for check in report.checks:
-            if check.passed or check.skipped:
-                continue
-            problems.append(
-                Problem(
-                    "error",
-                    f"Self-test failed: {check.name}",
-                    cause=check.detail,
-                    action="Include this report when asking for support.",
-                )
-            )
+    if run_tests and not dependency_installing:
+        add_self_test_results(report, run_self_tests())
 
     return report
 
@@ -652,6 +826,11 @@ def format_report(report):
         time.strftime("%Y-%m-%d %H:%M:%S"),
         "=" * 60,
     ]
+    if report.highlights:
+        lines.append("")
+        lines.append("[Top 7 risk parameters]")
+        for label, value, level in report.highlights:
+            lines.append(f"  {label}: {value} [{level}]")
     for title, section_lines in report.sections:
         lines.append("")
         lines.append(f"[{title}]")

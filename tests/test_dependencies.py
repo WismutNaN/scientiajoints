@@ -37,6 +37,42 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual(result.missing_after_install, ())
         self.assertIn("Dependencies already installed", result.messages[0])
 
+    def test_panel_safe_detection_never_imports_the_package(self):
+        with unittest.mock.patch.object(
+            self.dependencies.importlib,
+            "import_module",
+            side_effect=AssertionError("must not import during UI detection"),
+        ):
+            statuses = self.dependencies.lightweight_package_statuses(("sys",))
+
+        self.assertTrue(statuses[0].installed)
+        self.assertFalse(statuses[0].verified)
+
+    def test_extension_mode_only_verifies_and_never_runs_pip(self):
+        runtime = self.dependencies.current_python_runtime("python.exe")
+        statuses = (
+            self.dependencies.DependencyStatus("matplotlib", True),
+            self.dependencies.DependencyStatus("mplstereonet", True),
+            self.dependencies.DependencyStatus("numpy", True),
+        )
+        with unittest.mock.patch.object(
+            self.dependencies, "probe_python_runtime", return_value=(runtime, "")
+        ), unittest.mock.patch.object(
+            self.dependencies, "probe_package_imports", return_value=statuses
+        ), unittest.mock.patch.object(
+            self.dependencies,
+            "_pip_available",
+            side_effect=AssertionError("Extension mode must not run pip"),
+        ):
+            result = self.dependencies.install_required_packages(
+                python_executable="python.exe",
+                expected_runtime=runtime,
+                check_only=True,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.source, "existing")
+
 
 class PythonExecutableTests(unittest.TestCase):
     def setUp(self):
@@ -67,6 +103,49 @@ class PythonExecutableTests(unittest.TestCase):
             os.path.normcase(os.path.abspath(resolved)),
             os.path.normcase(os.path.abspath(blender_binary)),
         )
+
+    def test_a_different_python_minor_version_is_rejected(self):
+        expected = self.dependencies.PythonRuntime(
+            "C:/Blender/python.exe",
+            "cpython",
+            (3, 13, 2),
+            "cpython-313",
+            64,
+            "Windows",
+            "AMD64",
+        )
+        actual = self.dependencies.PythonRuntime(
+            "C:/Other/python.exe",
+            "cpython",
+            (3, 12, 9),
+            "cpython-312",
+            64,
+            "Windows",
+            "AMD64",
+        )
+
+        message = self.dependencies.runtime_mismatch(expected, actual)
+
+        self.assertIn("3.12", message)
+        self.assertIn("3.13", message)
+
+    def test_runtime_probe_timeout_names_the_failing_stage(self):
+        with unittest.mock.patch.object(
+            self.dependencies.subprocess,
+            "run",
+            side_effect=self.dependencies.subprocess.TimeoutExpired(
+                ("python.exe", "-c", "probe"),
+                3,
+            ),
+        ):
+            runtime, error = self.dependencies.probe_python_runtime(
+                "python.exe",
+                timeout=3,
+            )
+
+        self.assertIsNone(runtime)
+        self.assertIn("runtime detection timed out", error)
+        self.assertIn("python.exe", error)
 
 
 class PathBudgetTests(unittest.TestCase):
@@ -111,6 +190,27 @@ class OfflineWheelTests(unittest.TestCase):
 
         self.assertIn(str(wheel), wheels)
 
+    def test_only_wheels_matching_the_active_python_tags_are_selected(self):
+        from pip._vendor.packaging.tags import Tag
+
+        wheels = (
+            "C:/addon/wheels/contourpy-1.3.3-cp313-cp313-win_amd64.whl",
+            "C:/addon/wheels/contourpy-1.3.3-cp312-cp312-win_amd64.whl",
+            "C:/addon/wheels/mplstereonet-0.6.3-py3-none-any.whl",
+        )
+        selection = self.dependencies.select_compatible_wheels(
+            wheels,
+            supported_tags=(
+                Tag("cp313", "cp313", "win_amd64"),
+                Tag("py3", "none", "any"),
+            ),
+        )
+
+        self.assertEqual(len(selection.compatible), 2)
+        self.assertTrue(any("cp313" in path for path in selection.compatible))
+        self.assertTrue(any("py3-none-any" in path for path in selection.compatible))
+        self.assertEqual(selection.incompatible, (wheels[1],))
+
     def test_offline_install_command_never_reaches_a_package_index(self):
         target = self.dependencies.InstallTarget(
             path="C:/blender/modules",
@@ -121,18 +221,96 @@ class OfflineWheelTests(unittest.TestCase):
         )
         command = self.dependencies._install_command(
             "python.exe",
-            ("matplotlib",),
+            ("matplotlib", "mplstereonet", "contourpy"),
             target,
             ("C:/addon/wheels",),
             "",
             (),
+            no_dependencies=True,
         )
 
         self.assertIn("--no-index", command)
         self.assertIn("--find-links", command)
         self.assertIn("--no-input", command)
         self.assertIn("--only-binary", command)
+        self.assertIn("--no-deps", command)
         self.assertIn("--target", command)
+        self.assertNotIn("numpy", command)
+
+    def test_the_bundled_wheel_set_never_installs_a_second_numpy(self):
+        packages = self.dependencies._bundled_wheel_packages((
+            "C:/addon/wheels/matplotlib-3.11.1-cp313-cp313-win_amd64.whl",
+            "C:/addon/wheels/contourpy-1.3.3-cp313-cp313-win_amd64.whl",
+            "C:/addon/wheels/numpy-2.5.1-cp313-cp313-win_amd64.whl",
+        ))
+
+        self.assertEqual(packages, ("contourpy", "matplotlib"))
+
+    def test_offline_legacy_install_reaches_pip_with_the_complete_safe_set(self):
+        target = self.dependencies.InstallTarget(
+            path="C:/Blender/scripts/modules",
+            kind="target",
+            on_sys_path=False,
+            writable=True,
+            path_budget_ok=True,
+        )
+        wheels = (
+            "C:/addon/wheels/matplotlib-3.11.1-cp313-cp313-win_amd64.whl",
+            "C:/addon/wheels/contourpy-1.3.3-cp313-cp313-win_amd64.whl",
+            "C:/addon/wheels/numpy-2.5.1-cp313-cp313-win_amd64.whl",
+        )
+        commands = []
+        runtime = self.dependencies.current_python_runtime("python.exe")
+        probe_results = iter((
+            (
+                self.dependencies.DependencyStatus("matplotlib", False),
+                self.dependencies.DependencyStatus("numpy", True),
+            ),
+            (
+                self.dependencies.DependencyStatus("matplotlib", True),
+                self.dependencies.DependencyStatus("numpy", True),
+            ),
+        ))
+
+        def run_install(command, timeout):
+            commands.append(command)
+            return self.dependencies.InstallAttempt(
+                source="",
+                command=command,
+                returncode=0,
+            )
+
+        with unittest.mock.patch.object(
+            self.dependencies, "probe_python_runtime", lambda *a, **k: (runtime, "")
+        ), unittest.mock.patch.object(
+            self.dependencies, "probe_package_imports", lambda *a, **k: next(probe_results)
+        ), unittest.mock.patch.object(
+            self.dependencies, "_pip_available", lambda *args, **kwargs: (True, "pip test")
+        ), unittest.mock.patch.object(
+            self.dependencies, "available_wheels", lambda extra=(): wheels
+        ), unittest.mock.patch.object(
+            self.dependencies, "wheel_directories", lambda extra=(): ("C:/addon/wheels",)
+        ), unittest.mock.patch.object(
+            self.dependencies, "_run_install", run_install
+        ), unittest.mock.patch.object(
+            self.dependencies, "bundled_package_versions", lambda packages=(): {}
+        ), unittest.mock.patch.object(
+            self.dependencies, "_ensure_on_sys_path", lambda target: None
+        ):
+            result = self.dependencies.install_required_packages(
+                packages=("matplotlib", "numpy"),
+                python_executable="python.exe",
+                allow_online=False,
+                install_target=target,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(commands), 1)
+        self.assertIn("--no-index", commands[0])
+        self.assertIn("--no-deps", commands[0])
+        self.assertTrue(any("matplotlib-" in part for part in commands[0]))
+        self.assertTrue(any("contourpy-" in part for part in commands[0]))
+        self.assertFalse(any("numpy-" in part for part in commands[0]))
 
     def test_user_site_is_never_used(self):
         """Blender disables the user site, so --user installs land off sys.path."""
@@ -264,8 +442,9 @@ class AutomaticInstallPolicyTests(unittest.TestCase):
 
     def test_a_recent_failed_attempt_is_not_repeated(self):
         """Retrying pip at every start is what made Blender look frozen."""
-        state = {"last_attempt": 1000.0, "ok": False}
+        state = {"last_attempt": 1000.0, "ok": False, "fingerprint": "same-build"}
         self.dependencies.read_install_state = lambda: state
+        self.dependencies.automatic_install_fingerprint = lambda packages: "same-build"
 
         self.assertFalse(
             self.dependencies.should_attempt_automatic_install(
@@ -279,6 +458,65 @@ class AutomaticInstallPolicyTests(unittest.TestCase):
                 now=1000.0 + self.dependencies.INSTALL_RETRY_INTERVAL_SECONDS + 1.0,
             )
         )
+
+    def test_a_new_install_policy_retries_immediately(self):
+        self.dependencies.read_install_state = lambda: {
+            "last_attempt": 1000.0,
+            "ok": False,
+            "fingerprint": "old-build",
+        }
+        self.dependencies.automatic_install_fingerprint = lambda packages: "new-build"
+
+        self.assertTrue(
+            self.dependencies.should_attempt_automatic_install(
+                ("scientiajoints_missing_test_package_zz",),
+                now=1001.0,
+            )
+        )
+
+
+class UserModulesTargetTests(unittest.TestCase):
+    def setUp(self):
+        self.dependencies = load_addon_module("dependencies")
+
+    def test_blenders_canonical_user_modules_directory_is_used(self):
+        calls = []
+
+        def user_resource(resource_type, path="", create=False):
+            calls.append((resource_type, path, create))
+            return "C:/Blender/scripts/modules" if path else "C:/Blender/scripts"
+
+        fake_bpy = types.SimpleNamespace(
+            utils=types.SimpleNamespace(user_resource=user_resource),
+        )
+        with unittest.mock.patch.dict(sys.modules, {"bpy": fake_bpy}):
+            directory = self.dependencies._user_scripts_modules_directory()
+
+        self.assertEqual(Path(directory), Path("C:/Blender/scripts/modules"))
+        self.assertIn(("SCRIPTS", "modules", True), calls)
+        self.assertNotIn("addons", Path(directory).parts)
+
+    def test_a_clean_user_target_can_be_chosen_before_it_was_on_sys_path(self):
+        target = self.dependencies.InstallTarget(
+            path="C:/Blender/scripts/modules",
+            kind="target",
+            on_sys_path=False,
+            writable=True,
+            path_budget_ok=True,
+        )
+
+        self.assertTrue(target.usable)
+
+    def test_extension_preparation_does_not_add_a_legacy_install_target(self):
+        with unittest.mock.patch.object(
+            self.dependencies,
+            "__package__",
+            "bl_ext.user_default.scientiajoints",
+        ):
+            prepared = self.dependencies.prepare_background_install()
+
+        self.assertTrue(prepared["check_only"])
+        self.assertNotIn("install_target", prepared)
 
 
 class BackgroundInstallTests(unittest.TestCase):

@@ -117,6 +117,20 @@ class ReleasePackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "run_startup_diagnostics"):
                 validate_release(broken_path)
 
+    def test_validation_rejects_a_release_without_chart_wheels(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            release_path = Path(temporary_directory) / "release.zip"
+            broken_path = Path(temporary_directory) / "broken.zip"
+            build_release(ADDON_ROOT, release_path)
+
+            with zipfile.ZipFile(release_path) as source, zipfile.ZipFile(broken_path, "w") as target:
+                for info in source.infolist():
+                    if "/wheels/" not in info.filename:
+                        target.writestr(info, source.read(info.filename))
+
+            with self.assertRaisesRegex(ValueError, "independently installable"):
+                validate_release(broken_path)
+
 
 class ExtensionPackageTests(unittest.TestCase):
     """The extension build is what makes the add-on installable offline.
@@ -159,14 +173,23 @@ class ExtensionPackageTests(unittest.TestCase):
 
         self.assertFalse([path for path in wheels if path.name.lower().startswith("numpy-")])
 
-    def test_the_legacy_archive_keeps_numpy_for_offline_pip(self):
-        """`pip --target` resolves without looking at installed packages, so an
-        offline install fails when numpy is missing from the wheel directory."""
-        wheels = wheel_files(ADDON_ROOT, include_bundled_packages=True)
-        if not wheels:
-            self.skipTest("no wheels fetched; run tools/fetch_wheels.py")
+    def test_the_legacy_archive_does_not_ship_a_second_numpy(self):
+        """The legacy installer uses the complete local set with --no-deps, so
+        Blender's numpy remains the only copy on sys.path."""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            archive_path = Path(temporary_directory) / "legacy.zip"
+            build_release(ADDON_ROOT, archive_path)
+            with zipfile.ZipFile(archive_path) as archive:
+                wheel_names = [
+                    name for name in archive.namelist()
+                    if name.startswith("ScientiaJoints/wheels/")
+                ]
 
-        self.assertTrue([path for path in wheels if path.name.lower().startswith("numpy-")])
+        self.assertTrue(wheel_names, "the legacy archive must work without the extension")
+        self.assertFalse([
+            name for name in wheel_names
+            if Path(name).name.lower().startswith("numpy-")
+        ])
 
     def test_wheel_platform_tags_map_to_blender_platforms(self):
         platforms = blender_platforms_for_wheels((

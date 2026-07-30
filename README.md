@@ -83,7 +83,8 @@ Two archives are published for every version. They install `matplotlib` and
 
 `ScientiaJoints-<version>-extension.zip` carries the wheels inside the archive.
 Blender unpacks them itself, with no pip run, no package index and no network.
-The installation path is short.
+The installation path is short. The add-on only verifies this Blender-managed
+environment; it never falls back to packages installed by a legacy copy.
 
 1. Download the extension ZIP. A GitHub `Source code` archive is not an
    installable package.
@@ -94,11 +95,17 @@ The installation path is short.
 
 `ScientiaJoints-<version>.zip` installs through
 `Edit > Preferences > Add-ons > Install from Disk`. The add-on installs the
-chart packages itself: first from the bundled wheels, and from PyPI if that
-fails. The installation runs on a worker thread and does not block Blender.
-Progress and the result appear in the add-on panel. A failed automatic attempt
-is repeated no more than once a day. The `SCIENTIAJOINTS_NO_AUTO_INSTALL`
-environment variable disables the automatic attempt.
+chart packages into the per-user `scripts/modules` directory: first from the
+bundled wheels, and from PyPI if that fails. Blender's own numpy is neither
+replaced nor duplicated. Before pip starts, the add-on verifies the actual
+Blender Python executable, version, ABI and bitness, then selects only bundled
+wheels compatible with that runtime. The per-user target belongs to the active
+Blender version and is checked for writability on the worker. Installation does
+not block Blender; the panel names the current stage, asks the user to wait, and
+shows an explicit completion or an error with the stage that failed. A failed
+automatic attempt is repeated no more than once a day. The
+`SCIENTIAJOINTS_NO_AUTO_INSTALL` environment variable disables the automatic
+attempt.
 
 The archive always contains `ScientiaJoints/__init__.py`. Blender requires that
 directory name, and it does not depend on the name of the ZIP itself. An archive
@@ -110,8 +117,16 @@ contours on the stereonet from being drawn.
 
 ### If the charts do not appear
 
-The `i` icon in the panel header opens the diagnostics report. The report names
-the cause and the action. The observed causes:
+The `i` icon in the panel header immediately opens a quick diagnostics report.
+Its first block shows the seven values most likely to explain an installation
+failure: Blender, installation mode, active Python, the pip interpreter, target
+directory, package state and compatible offline wheels. It is a popup without
+the ambiguous `OK`/`Cancel` pair. Six extended tests have a separate
+`Start Full Check` button and a visible completed/total counter. Chart tests run outside Blender with a hard
+timeout, and package imports are also probed in disposable processes, so a bad
+binary package cannot freeze the UI. Package probes are paused while the legacy
+installer is writing them. The report names both the failed stage and its
+source. The observed causes:
 
 - the packages are not installed; the panel shows which are missing and offers
   the install button;

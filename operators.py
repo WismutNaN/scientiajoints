@@ -1,4 +1,6 @@
 import math
+import importlib
+import threading
 
 import bpy
 from bpy.types import Operator
@@ -18,10 +20,90 @@ DIAGNOSTICS_TEXT_NAME = "ScientiaJoints Diagnostics"
 
 #: Last diagnostics report, kept so the popup buttons can act on it without
 #: rebuilding (and re-running the self-test) on every redraw.
-_last_report = {"text": "", "problems": (), "checks": ()}
+_last_report = {"text": "", "problems": (), "checks": (), "highlights": ()}
+_diagnostics_test_state = {
+    "job": None,
+    "status": "idle",
+    "completed": 0,
+    "total": 6,
+    "current": "",
+    "message": "Extended tests have not been run.",
+}
+
+
+def _fresh_diagnostics_module():
+    """Reload diagnostics after an in-place update, before starting any job."""
+    diagnostics = importlib.import_module(f"{__package__}.diagnostics")
+
+    job = _diagnostics_test_state.get("job")
+    if job is not None and job.running:
+        return diagnostics
+    try:
+        importlib.invalidate_caches()
+        return importlib.reload(diagnostics)
+    except Exception:
+        logger.warning("Could not reload diagnostics.py", exc_info=True)
+        return diagnostics
+
+
+def _diagnostics_highlights():
+    """Seven plain-language values that remain available after a mixed update."""
+    runtime = deps.current_python_runtime()
+    statuses = deps.safe_dependency_statuses()
+    missing = [status.name for status in statuses if not status.installed]
+    broken = [status.name for status in statuses if status.error]
+    verified = sum(1 for status in statuses if status.installed and status.verified)
+    extension = deps.installed_as_extension()
+    target = None if extension else deps.choose_install_target(probe_writable=False)
+    selection = deps.select_compatible_wheels(deps.available_wheels())
+
+    if broken:
+        packages = "Import failed: " + ", ".join(broken)
+        package_level = "error"
+    elif missing:
+        packages = "Missing: " + ", ".join(missing)
+        package_level = "error"
+    elif verified == len(statuses):
+        packages = f"Ready — all {len(statuses)} libraries verified"
+        package_level = "ok"
+    else:
+        packages = f"Found — {verified} of {len(statuses)} verified in the background"
+        package_level = "info"
+
+    install_mode = (
+        "Extension — packages are managed by Blender"
+        if extension
+        else "Legacy add-on — uses the bundled offline installer"
+    )
+    install_location = (
+        "Blender Extension environment"
+        if extension
+        else (target.path if target else "No usable directory found")
+    )
+    return (
+        ("Blender version", str(getattr(bpy.app, "version_string", "unknown")), "info"),
+        ("Installation type", install_mode, "info"),
+        ("Python used by Blender", runtime.summary, "ok"),
+        ("Python used for package setup", runtime.executable or "Not found", "ok" if runtime.executable else "error"),
+        ("Package install location", install_location, "info" if extension or target else "error"),
+        ("Chart libraries", packages, package_level),
+        (
+            "Offline installer files",
+            f"{len(selection.compatible)} suitable, {len(selection.incompatible)} ignored for this Python",
+            "ok" if selection.compatible else "warning",
+        ),
+    )
 
 #: State of the background dependency installation, read by the panel.
-_install_state = {"job": None, "status": "idle", "message": "", "log": ""}
+_install_state = {
+    "job": None,
+    "status": "idle",
+    "stage": "",
+    "message": "",
+    "log": "",
+    "elapsed": 0.0,
+    "show_completion": False,
+}
 
 
 # ============================================================
@@ -133,7 +215,15 @@ def dependencies_are_installing():
 
 
 def reset_install_state():
-    _install_state.update(job=None, status="idle", message="", log="")
+    _install_state.update(
+        job=None,
+        status="idle",
+        stage="",
+        message="",
+        log="",
+        elapsed=0.0,
+        show_completion=False,
+    )
 
 
 def start_dependency_install(automatic=False, on_finished=None):
@@ -146,20 +236,36 @@ def start_dependency_install(automatic=False, on_finished=None):
     if dependencies_are_installing():
         return False
 
-    job = deps.BackgroundInstall()
+    try:
+        prepared = deps.prepare_background_install()
+    except Exception as e:
+        logger.warning("Could not prepare the dependency install: %s", e, exc_info=True)
+        prepared = {"python_executable": deps.resolve_python_executable(), "install_target": None}
+
+    job = deps.BackgroundInstall(**prepared)
     if not job.start():
         return False
 
     _install_state.update(
         job=job,
         status="running",
-        message="Installing chart packages...",
+        stage="starting",
+        message="Checking Python and chart packages…",
         log="",
+        elapsed=0.0,
+        show_completion=False,
     )
     logger.info("ScientiaJoints dependency installation started (%s).", "automatic" if automatic else "manual")
 
     def _poll():
         if job.running:
+            snapshot = job.snapshot()
+            _install_state.update(
+                stage=snapshot.get("stage", ""),
+                message=snapshot.get("message", "Checking chart packages…"),
+                elapsed=float(snapshot.get("elapsed", 0.0) or 0.0),
+            )
+            _tag_ui_redraw()
             return 0.5
         result = job.result()
         _finish_dependency_install(result, automatic=automatic)
@@ -179,7 +285,13 @@ def start_dependency_install(automatic=False, on_finished=None):
 
 def _finish_dependency_install(result, automatic=False):
     if result is None:
-        _install_state.update(job=None, status="failed", message="Installation produced no result.")
+        _install_state.update(
+            job=None,
+            status="failed",
+            stage="result",
+            message="Dependency check produced no result.",
+            show_completion=False,
+        )
         return
 
     deps.record_install_attempt(result)
@@ -188,18 +300,34 @@ def _finish_dependency_install(result, automatic=False):
         log = f"{log}\n\n{result.log}"
 
     if result.ok:
-        message = "Chart packages installed. Histogram and stereonet are available."
-        logger.info("ScientiaJoints dependencies installed:\n%s", log)
+        if result.source == "existing":
+            message = "Chart packages checked and ready."
+        else:
+            message = "Installation finished. Histogram and stereonet are ready."
+        logger.info("ScientiaJoints dependencies ready:\n%s", log)
     else:
-        message = "Could not install: " + ", ".join(result.missing_after_install or ("unknown",))
+        stage = result.failed_stage or "dependency installation"
+        source = result.error_source or ", ".join(
+            result.missing_after_install or ("unknown error",)
+        )
+        message = f"Stopped at {stage}: {source}"
         logger.warning("ScientiaJoints dependency installation failed:\n%s", log)
 
     _install_state.update(
         job=None,
         status="ok" if result.ok else "failed",
+        stage="done" if result.ok else (result.failed_stage or "failed"),
         message=message,
         log=log,
+        elapsed=0.0,
+        show_completion=bool(result.ok and result.source not in ("", "existing")),
     )
+    try:
+        from . import panel
+
+        panel.invalidate_dependency_cache()
+    except Exception:
+        pass
     _tag_ui_redraw()
 
 
@@ -228,7 +356,220 @@ class ScientiaInstallDependenciesOperator(Operator):
         if not start_dependency_install(automatic=False):
             self.report({'ERROR'}, "Could not start the installation. See the console for details.")
             return {'CANCELLED'}
-        self.report({'INFO'}, "Installing chart packages in the background; Blender stays responsive.")
+        self.report(
+            {'INFO'},
+            "Checking and installing chart packages in the background. "
+            "Please wait for the completion message.",
+        )
+        return {'FINISHED'}
+
+
+class _DiagnosticsSelfTestJob:
+    """Run Blender-independent checks one by one away from the UI thread."""
+
+    def __init__(self, diagnostics_module):
+        self.diagnostics = diagnostics_module
+        self._thread = None
+        self._checks = []
+        self._current = ""
+        self._error = ""
+        self._lock = threading.Lock()
+
+    def start(self):
+        if self.running:
+            return False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="ScientiaJoints-diagnostics-self-test",
+            daemon=True,
+        )
+        self._thread.start()
+        return True
+
+    def _run(self):
+        cases_factory = getattr(self.diagnostics, "self_test_cases", None)
+        if not callable(cases_factory):
+            with self._lock:
+                self._error = (
+                    "diagnostics.py is from a different ScientiaJoints version. "
+                    "Restart Blender after reinstalling the complete archive."
+                )
+            return
+        for name, checker in cases_factory(include_overlay=False):
+            with self._lock:
+                self._current = name
+            try:
+                check = checker()
+            except Exception as e:  # pragma: no cover - defensive
+                check = self.diagnostics.CheckResult(
+                    name,
+                    False,
+                    f"{type(e).__name__}: {e}",
+                )
+            if check is not None:
+                with self._lock:
+                    self._checks.append(check)
+        with self._lock:
+            self._current = ""
+
+    @property
+    def running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "completed": len(self._checks),
+                "current": self._current,
+                "checks": tuple(self._checks),
+                "error": self._error,
+            }
+
+
+def _store_diagnostics_report(report, diagnostics_module):
+    text = diagnostics_module.format_report(report)
+    highlights = tuple(getattr(report, "highlights", ()) or ())
+    if not highlights:
+        try:
+            highlights = _diagnostics_highlights()
+        except Exception:
+            logger.debug("Could not build fallback diagnostics highlights", exc_info=True)
+            highlights = ()
+    _last_report.update(
+        text=text,
+        problems=tuple(getattr(report, "problems", ()) or ()),
+        checks=tuple(getattr(report, "checks", ()) or ()),
+        highlights=highlights,
+    )
+    _store_report_text(text)
+
+
+class ScientiaDiagnosticsRunTestsOperator(Operator):
+    bl_idname = "wm.scientia_diagnostics_run_tests"
+    bl_label = "Run 6 Extended Tests"
+    bl_description = (
+        "Run six explicit checks one by one in the background; "
+        "the Diagnostics window shows how many have completed"
+    )
+
+    def execute(self, context):
+        if dependencies_are_installing():
+            self.report({'WARNING'}, "Wait for chart package installation to finish first.")
+            return {'CANCELLED'}
+        existing = _diagnostics_test_state.get("job")
+        if existing is not None and existing.running:
+            self.report({'INFO'}, "Extended diagnostics are already running.")
+            return {'CANCELLED'}
+
+        diagnostics = _fresh_diagnostics_module()
+        required_api = ("SELF_TEST_COUNT", "self_test_cases", "add_self_test_results")
+        missing_api = [name for name in required_api if not hasattr(diagnostics, name)]
+        if missing_api:
+            message = (
+                "ScientiaJoints files are from different versions "
+                f"(diagnostics.py is missing {', '.join(missing_api)}). "
+                "Restart Blender after reinstalling the complete archive."
+            )
+            _diagnostics_test_state.update(
+                job=None,
+                status="failed",
+                completed=0,
+                total=6,
+                current="",
+                message=message,
+            )
+            self.report({'ERROR'}, message)
+            _tag_ui_redraw()
+            return {'CANCELLED'}
+
+        job = _DiagnosticsSelfTestJob(diagnostics)
+        total = int(getattr(diagnostics, "SELF_TEST_COUNT", 6) or 6)
+        _diagnostics_test_state.update(
+            job=job,
+            status="running",
+            completed=0,
+            total=total,
+            current="Starting…",
+            message="Extended diagnostics are running in the background.",
+        )
+        if not job.start():
+            _diagnostics_test_state.update(
+                job=None,
+                status="failed",
+                message="Could not start extended diagnostics.",
+            )
+            self.report({'ERROR'}, "Could not start extended diagnostics.")
+            return {'CANCELLED'}
+        _tag_ui_redraw()
+
+        def _poll():
+            snapshot = job.snapshot()
+            _diagnostics_test_state.update(
+                completed=snapshot["completed"],
+                current=snapshot["current"],
+            )
+            _tag_ui_redraw()
+            if job.running:
+                return 0.25
+
+            if snapshot.get("error"):
+                _diagnostics_test_state.update(
+                    job=None,
+                    status="failed",
+                    current="",
+                    message=snapshot["error"],
+                )
+                _tag_ui_redraw()
+                return None
+
+            checks = list(snapshot["checks"])
+            # This single Blender-API check is deliberately kept on the main
+            # thread; it is quick and cannot build caches or touch the network.
+            overlay_check = getattr(diagnostics, "_check_overlay", None)
+            if callable(overlay_check):
+                checks.append(overlay_check())
+            else:
+                checks.append(
+                    diagnostics.CheckResult(
+                        "Viewport overlay and panel",
+                        False,
+                        "diagnostics.py does not provide the overlay test.",
+                    )
+                )
+            report = diagnostics.build_report(
+                bpy.context,
+                run_tests=False,
+                dependency_installing=False,
+            )
+            diagnostics.add_self_test_results(report, checks)
+            _store_diagnostics_report(report, diagnostics)
+            passed = sum(1 for check in checks if check.passed or check.skipped)
+            _diagnostics_test_state.update(
+                job=None,
+                status="done",
+                completed=len(checks),
+                total=len(checks),
+                current="",
+                message=f"Extended diagnostics finished: {passed}/{len(checks)} passed.",
+            )
+            _tag_ui_redraw()
+            return None
+
+        try:
+            bpy.app.timers.register(_poll, first_interval=0.25)
+        except Exception as e:
+            _diagnostics_test_state.update(
+                job=None,
+                status="failed",
+                message=f"Could not monitor extended diagnostics: {e}",
+            )
+            self.report({'ERROR'}, _diagnostics_test_state["message"])
+            return {'CANCELLED'}
+
+        self.report(
+            {'INFO'},
+            "Extended diagnostics started. Progress is shown in the Diagnostics window.",
+        )
         return {'FINISHED'}
 
 
@@ -236,77 +577,159 @@ class ScientiaDiagnosticsOperator(Operator):
     bl_idname = "wm.scientia_diagnostics"
     bl_label = "ScientiaJoints Diagnostics"
     bl_description = (
-        "Collect Blender, device, dependency and measurement information, run a self-test, "
-        "and list detected problems with their probable cause"
-    )
-
-    run_self_tests: bpy.props.BoolProperty(
-        name="Run self-test",
-        description="Render a test chart and export a test file to a temporary directory",
-        default=True,
+        "Show seven important environment values, detected problems, and explicit self-test status"
     )
 
     def execute(self, context):
+        # The dialog confirmation button only closes the window. Extended
+        # checks have their own explicit button and never hide behind OK.
         return {'FINISHED'}
 
     def invoke(self, context, event):
-        from . import diagnostics
+        if not self._collect_report(context, run_tests=False):
+            return {'CANCELLED'}
+        return context.window_manager.invoke_popup(self, width=720)
 
+    def _collect_report(self, context, run_tests):
+        diagnostics = _fresh_diagnostics_module()
         try:
-            report = diagnostics.build_report(context, run_tests=self.run_self_tests)
-            text = diagnostics.format_report(report)
+            installing = dependencies_are_installing()
+            report = diagnostics.build_report(
+                context,
+                run_tests=bool(run_tests and not installing),
+                dependency_installing=installing,
+            )
+            add_results = getattr(diagnostics, "add_self_test_results", None)
+            if not run_tests and _last_report["checks"] and callable(add_results):
+                add_results(report, _last_report["checks"])
         except Exception as e:
             logger.error("Diagnostics failed: %s", e, exc_info=True)
             self.report({'ERROR'}, f"Diagnostics failed: {e}")
-            return {'CANCELLED'}
+            return False
 
-        _last_report.update(text=text, problems=tuple(report.problems), checks=tuple(report.checks))
-        _store_report_text(text)
-        return context.window_manager.invoke_props_dialog(self, width=560)
+        _store_diagnostics_report(report, diagnostics)
+        return True
 
     def draw(self, context):
         layout = self.layout
         problems = _last_report["problems"]
         checks = _last_report["checks"]
+        try:
+            highlights = _diagnostics_highlights()
+        except Exception:
+            highlights = _last_report["highlights"]
 
         header = layout.row()
-        if not problems:
-            header.label(text="No problems detected.", icon='CHECKMARK')
-        else:
-            errors = sum(1 for problem in problems if problem.severity == "error")
-            warnings = sum(1 for problem in problems if problem.severity == "warning")
+        errors = sum(
+            1 for problem in problems
+            if getattr(problem, "severity", "") == "error"
+        )
+        warnings = sum(
+            1 for problem in problems
+            if getattr(problem, "severity", "") == "warning"
+        )
+        if errors:
             header.label(
-                text=f"{errors} error(s), {warnings} warning(s), {len(problems) - errors - warnings} note(s)",
-                icon='ERROR' if errors else 'INFO',
+                text=f"Action required — {errors} problem(s) can stop ScientiaJoints",
+                icon='ERROR',
             )
+        elif warnings:
+            header.label(
+                text=f"ScientiaJoints is ready — {warnings} project note(s) below",
+                icon='CHECKMARK',
+            )
+        else:
+            header.label(text="ScientiaJoints is ready", icon='CHECKMARK')
 
-        if checks:
-            box = layout.box()
-            box.label(text="Self-test")
-            grid = box.grid_flow(columns=2, even_columns=True, align=True)
+        summary = layout.box()
+        summary.label(text="System and package setup")
+        for label, value, level in highlights[:7]:
+            split = summary.split(factor=0.32)
+            icon = {
+                "ok": 'CHECKMARK',
+                "error": 'ERROR',
+                "warning": 'ERROR',
+                "info": 'INFO',
+            }.get(level, 'INFO')
+            split.label(text=label, icon=icon)
+            value_column = split.column(align=True)
+            for line in _wrap(str(value), 72):
+                value_column.label(text=line)
+
+        test_box = layout.box()
+        test_box.label(text="Optional full check")
+        test_box.label(text="Checks geometry, CSV export, charts, and the viewport.")
+        test_status = _diagnostics_test_state["status"]
+        completed = int(_diagnostics_test_state["completed"])
+        total = int(_diagnostics_test_state["total"])
+        if test_status == "running":
+            test_box.label(
+                text=f"Running — {completed} of {total} completed: "
+                f"{_diagnostics_test_state['current'] or 'finishing…'}",
+                icon='SORTTIME',
+            )
+            test_box.label(text="You can keep working in Blender.")
+        elif test_status == "failed":
+            test_box.label(text="The full check could not start or finish.", icon='ERROR')
+            for line in _wrap(str(_diagnostics_test_state["message"]), 90):
+                test_box.label(text=line)
+        elif checks:
+            passed = sum(1 for check in checks if check.passed or check.skipped)
+            test_box.label(
+                text=f"Finished — {len(checks)} of {total} completed, {passed} passed.",
+                icon='CHECKMARK' if passed == len(checks) else 'ERROR',
+            )
+            grid = test_box.grid_flow(columns=2, even_columns=True, align=True)
             for check in checks:
-                icon = 'CHECKMARK' if check.passed else 'X'
+                icon = 'CHECKMARK' if check.passed or check.skipped else 'X'
                 grid.label(text=check.name, icon=icon)
+        else:
+            test_box.label(text=f"Not run yet — 0 of {total} completed.", icon='INFO')
 
-        for problem in problems[:8]:
+        row = test_box.row()
+        row.enabled = test_status != "running" and not dependencies_are_installing()
+        row.operator(
+            "wm.scientia_diagnostics_run_tests",
+            text="Start Full Check" if not checks else "Run Full Check Again",
+            icon='PLAY',
+        )
+
+        for problem in problems[:5]:
             box = layout.box()
-            icon = {'error': 'ERROR', 'warning': 'ERROR', 'info': 'INFO'}.get(problem.severity, 'INFO')
-            box.label(text=problem.title, icon=icon)
-            for line in _wrap(problem.cause, 78):
-                box.label(text=f"    {line}")
-            for line in _wrap(problem.action, 78):
-                box.label(text=f"    > {line}")
+            severity = getattr(problem, "severity", "info")
+            icon = {'error': 'ERROR', 'warning': 'ERROR', 'info': 'INFO'}.get(severity, 'INFO')
+            box.label(text=str(getattr(problem, "title", "Diagnostic note")), icon=icon)
+            cause = str(getattr(problem, "cause", "") or "")
+            action = str(getattr(problem, "action", "") or "")
+            if cause:
+                box.label(text="Why this matters:")
+                for line in _wrap(cause, 88):
+                    box.label(text=f"    {line}")
+            if action:
+                box.label(text="What to do:")
+                for line in _wrap(action, 88):
+                    box.label(text=f"    {line}")
 
-        if len(problems) > 8:
-            layout.label(text=f"...and {len(problems) - 8} more in the full report.")
+        if len(problems) > 5:
+            layout.label(text=f"...and {len(problems) - 5} more in the full report.")
 
-        layout.separator()
-        layout.label(text=f"Full report is in the Text editor as '{DIAGNOSTICS_TEXT_NAME}'.")
-        row = layout.row(align=True)
-        row.operator("wm.scientia_diagnostics_copy", icon='COPYDOWN')
-        row.operator("wm.scientia_diagnostics_save", icon='FILE_TICK')
-        if deps.missing_packages():
-            layout.operator("wm.scientia_install_dependencies", icon='IMPORT')
+        report_box = layout.box()
+        report_box.label(text="Support report")
+        report_box.label(text=f"Also available in the Text editor as '{DIAGNOSTICS_TEXT_NAME}'.")
+        row = report_box.row(align=True)
+        row.operator("wm.scientia_diagnostics_copy", text="Copy Full Report", icon='COPYDOWN')
+        row.operator("wm.scientia_diagnostics_save", text="Save Full Report", icon='FILE_TICK')
+        if dependencies_are_installing():
+            report_box.label(
+                text="Package setup is still running; import checks are temporarily paused.",
+                icon='SORTTIME',
+            )
+        elif deps.missing_packages() and not deps.installed_as_extension():
+            report_box.operator(
+                "wm.scientia_install_dependencies",
+                text="Install Missing Chart Libraries",
+                icon='IMPORT',
+            )
 
 
 class ScientiaDiagnosticsCopyOperator(Operator):

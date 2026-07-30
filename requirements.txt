@@ -3,4 +3,5 @@ matplotlib
 # density contour fails on the numpy Blender 5.x ships. See MINIMUM_VERSIONS
 # in dependencies.py.
 mplstereonet>=0.6.3
-numpy
+# Blender provides numpy. Installing another copy into an add-on target can
+# shadow Blender's ABI-compatible build and break matplotlib or other add-ons.

@@ -6,8 +6,9 @@ who cannot install one can fall back to the other:
 ``legacy``
     ``Edit > Preferences > Add-ons > Install from Disk``. Every file lives
     under a single ``ScientiaJoints/`` directory, which is the Python package
-    name Blender imports. Bundled wheels, if present, are installed by the
-    add-on with ``pip --no-index``.
+    name Blender imports. Bundled non-numpy wheels, if present, are installed
+    by the add-on with ``pip --no-index --no-deps`` so Blender keeps its own
+    numpy.
 
 ``extension``
     Blender 4.2+ extension. ``blender_manifest.toml`` sits at the archive root
@@ -36,6 +37,7 @@ WHEELS_DIRECTORY_NAME = "wheels"
 #: Packages every Blender build already ships. Shipping them again risks a
 #: second copy with a different ABI.
 BLENDER_BUNDLED_PACKAGES = frozenset({"numpy"})
+REQUIRED_WHEEL_DISTRIBUTIONS = frozenset({"matplotlib", "mplstereonet"})
 
 REQUIRED_ROOT_FILES = (
     "__init__.py",
@@ -80,6 +82,7 @@ REQUIRED_MODULE_SYMBOLS = {
         "RealTimeHistogramUpdateOperator",
         "RealTimeStereonetUpdateOperator",
         "ScientiaDiagnosticsOperator",
+        "ScientiaDiagnosticsRunTestsOperator",
         "ScientiaInstallDependenciesOperator",
         "ToggleLightSettingsOperator",
         "run_startup_diagnostics",
@@ -102,6 +105,9 @@ REQUIRED_MODULE_SYMBOLS = {
         "BackgroundInstall",
     ),
     "diagnostics.py": (
+        "SELF_TEST_COUNT",
+        "self_test_cases",
+        "add_self_test_results",
         "build_report",
         "format_report",
     ),
@@ -155,11 +161,10 @@ def wheel_files(addon_root, include_bundled_packages=True):
     """Wheels shipped with the add-on.
 
     ``include_bundled_packages=False`` drops wheels for packages Blender ships
-    itself. The extension build uses that: Blender already has numpy, and a
-    second copy in the extension site-packages only adds download size and a
-    chance of a binary incompatibility. The legacy build keeps it, because a
-    ``pip --target`` install resolves dependencies without looking at what is
-    already installed and would otherwise fail offline.
+    itself. Both release formats use that: Blender already has numpy, and a
+    second copy in either site-packages or the legacy user target can shadow
+    Blender's copy and break binary add-ons. The legacy installer passes the
+    complete remaining wheel set with ``--no-deps``.
     """
     directory = Path(addon_root).resolve() / WHEELS_DIRECTORY_NAME
     if not directory.is_dir():
@@ -204,7 +209,7 @@ def build_release(addon_root, output_path):
     entries = []
     for source_path in release_files(addon_root):
         entries.append((f"{PACKAGE_NAME}/{source_path.relative_to(addon_root).as_posix()}", source_path))
-    for wheel in wheel_files(addon_root):
+    for wheel in wheel_files(addon_root, include_bundled_packages=False):
         entries.append((f"{PACKAGE_NAME}/{WHEELS_DIRECTORY_NAME}/{wheel.name}", wheel))
 
     _write_archive(output_path, entries)
@@ -356,6 +361,21 @@ def _validate_common(names, entries):
     if any("__pycache__" in name or name.endswith((".pyc", ".pyo")) for name in names):
         raise ValueError("Release archive contains Python cache files")
 
+    packaged_wheels = [Path(name).name for name in names if "/wheels/" in f"/{name}"]
+    distributions = {_wheel_distribution(name) for name in packaged_wheels}
+    missing_distributions = sorted(REQUIRED_WHEEL_DISTRIBUTIONS.difference(distributions))
+    if missing_distributions:
+        raise ValueError(
+            "Release archive is not independently installable; missing wheels for: "
+            + ", ".join(missing_distributions)
+        )
+    duplicated_bundled = sorted(BLENDER_BUNDLED_PACKAGES.intersection(distributions))
+    if duplicated_bundled:
+        raise ValueError(
+            "Release archive must use Blender's bundled packages instead of shipping: "
+            + ", ".join(duplicated_bundled)
+        )
+
     for icon_name in REQUIRED_ICONS:
         archive_name = next(
             (name for name in names if name.endswith(f"{ICON_DIRECTORY_NAME}/{icon_name}")),
@@ -383,6 +403,14 @@ def _validate_common(names, entries):
             for node in module.body
             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
         }
+        for node in module.body:
+            if isinstance(node, ast.Assign):
+                symbols.update(
+                    target.id for target in node.targets
+                    if isinstance(target, ast.Name)
+                )
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                symbols.add(node.target.id)
         missing_symbols = sorted(set(expected_symbols).difference(symbols))
         if missing_symbols:
             raise ValueError(

@@ -223,6 +223,7 @@ class ScientiaMeasureDragOperator(Operator):
     bl_label = "Scientia Measure Drag"
     bl_description = "Create or edit a ScientiaJoints measurement"
     bl_options = {'UNDO'}
+    editable_kinds = frozenset({"LINEAR", "PLANE", "POLYLINE"})
 
     def invoke(self, context, event):
         if context.area.type != 'VIEW_3D':
@@ -248,7 +249,7 @@ class ScientiaMeasureDragOperator(Operator):
             measurement = context.scene.scientia_measurements[hit[0]]
             points = [_vector(point) for point in scene_measurement_points(measurement)]
 
-            if not is_active_measurement:
+            if not is_active_measurement or not _measurement_kind_in(measurement, self.editable_kinds):
                 self._mode = "select"
                 self._measure_index = hit[0]
                 self._depth_location = _average_point(points)
@@ -393,6 +394,7 @@ class ScientiaPolygonMeasureOperator(Operator):
 
     #: What the finished measurement is stored as.
     measurement_kind = "POLYLINE"
+    editable_kinds = frozenset({"PLANE", "POLYLINE"})
     #: Whether the outline closes back to its first point. The trace tool below
     #: is the same interaction with this off, so the two share everything.
     closes = True
@@ -423,6 +425,9 @@ class ScientiaPolygonMeasureOperator(Operator):
                 context.area.tag_redraw()
                 return {'FINISHED'}
             measurement = context.scene.scientia_measurements[hit[0]]
+            if not _measurement_kind_in(measurement, self.editable_kinds):
+                context.area.tag_redraw()
+                return {'FINISHED'}
             points = [_vector(point) for point in scene_measurement_points(measurement)]
             if not (0 <= hit[2] < len(points)):
                 context.area.tag_redraw()
@@ -600,6 +605,7 @@ class ScientiaTraceMeasureOperator(ScientiaPolygonMeasureOperator):
     bl_options = {'UNDO'}
 
     measurement_kind = "TRACE"
+    editable_kinds = frozenset({"TRACE"})
     #: A trace has two ends, so it never snaps back to its first point.
     closes = False
     minimum_points = 2
@@ -1229,6 +1235,7 @@ def _geometry_cache_key(scene, fill_alpha):
         round(float(fill_alpha), 4),
         bool(getattr(scene, "scientia_measure_show_linear", True)),
         bool(getattr(scene, "scientia_measure_show_planes", True)),
+        bool(getattr(scene, "scientia_measure_show_traces", True)),
         bool(getattr(scene, "scientia_measure_no_code_visible", True)),
         tuple(sorted(scene_measurement_code_styles(scene).items())),
         tuple(scene_measure_default_color(scene)),
@@ -1337,6 +1344,7 @@ def _anchor_cache_key(scene, code_styles):
         getattr(scene, "scientia_active_measurement_index", -1),
         bool(getattr(scene, "scientia_measure_show_linear", True)),
         bool(getattr(scene, "scientia_measure_show_planes", True)),
+        bool(getattr(scene, "scientia_measure_show_traces", True)),
         bool(getattr(scene, "scientia_measure_no_code_visible", True)),
         tuple(sorted((name, style[1]) for name, style in code_styles.items())),
     )
@@ -1424,8 +1432,9 @@ def _budgeted_indices(scene, indices, order, active_index, hover_index):
     limit = max(_label_budget(scene), (_handle_point_budget(scene) + 1) // 2) + 2
     wanted = []
     seen = set()
+    visible = set(indices)
     for index in (active_index, hover_index):
-        if index >= 0 and index not in seen:
+        if index in visible and index not in seen:
             seen.add(index)
             wanted.append(index)
     for position in order:
@@ -2006,6 +2015,11 @@ def _trace_label_lines(points, scene, measurement):
 
     if _label_enabled(scene, "scientia_label_trace_length", True):
         lines.append(f"trace {record.length:.3f}")
+    if (
+        _label_enabled(scene, "scientia_label_trace_span", True)
+        and record.span_length is not None
+    ):
+        lines.append(f"end distance {record.span_length:.3f}")
     if _label_enabled(scene, "scientia_label_trace_segments", False):
         lines.append(f"segments {record.segment_count}")
     if _label_enabled(scene, "scientia_label_trace_mean_segment", False) and record.mean_segment_length:
@@ -2281,6 +2295,8 @@ def active_measurement_record(scene):
             return None
         measurement = scene.scientia_measurements[index]
         points = [_vector(point.co) for point in measurement.points]
+        if _measurement_kind(measurement) == "TRACE" and len(points) >= 2:
+            return active_trace_record_from_points(points, scene, measurement)
         if len(points) == 2:
             return active_linear_record_from_points(points, scene, measurement)
         if len(points) >= 3:
@@ -2439,14 +2455,18 @@ def _code_visible(scene, code, code_styles):
 
 
 def _measurement_visible(scene, measurement, index=None, code_styles=None):
-    # The active measurement always stays visible: a fresh measurement starts
-    # as a 2-point linear one and must not vanish mid-edit when its kind or
-    # code group is hidden.
+    # Global kind switches mean "all": an active or hovered trace must not be
+    # smuggled back into the draw budget after traces were hidden.
+    if not _measurement_kind_visible(scene, measurement):
+        return False
+    # Keep an active measurement visible through a code-group change so its
+    # handles do not vanish during a coordinate edit. Kind switches above are
+    # explicit global display commands and therefore take priority.
     if index is not None and index == getattr(scene, "scientia_active_measurement_index", -1):
         return True
     if not _code_visible(scene, getattr(measurement, "code", ""), code_styles):
         return False
-    return _measurement_kind_visible(scene, measurement)
+    return True
 
 
 def _measurement_kind_visible(scene, measurement):
@@ -2460,6 +2480,11 @@ def _measurement_kind_visible(scene, measurement):
 
 def _measurement_kind(measurement):
     return str(getattr(measurement, "kind", "") or "").upper()
+
+
+def _measurement_kind_in(measurement, kinds):
+    """Small shared guard used by all three editing tools."""
+    return _measurement_kind(measurement) in kinds
 
 
 def _uniform_color_shader(gpu):

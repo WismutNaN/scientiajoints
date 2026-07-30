@@ -119,19 +119,25 @@ def _version_key(wheel_name):
 
 
 def drop_superseded_wheels(destination):
-    """Keep only the newest wheel of each distribution.
+    """Keep the newest wheel of each distribution *and compatibility tag*.
 
     ``pip wheel`` and ``pip download`` write the new version next to the old
     one. Two versions of the same distribution in ``wheels/`` make the offline
-    install pick whichever pip resolves first, which is how a fixed release can
-    still install the broken version it was meant to replace.
+    install ambiguous. Wheels for other Python ABIs and platforms are not
+    superseded by one another; deleting them made ``--all-platforms`` silently
+    leave only the last platform downloaded.
     """
     newest = {}
     for wheel in sorted(Path(destination).glob("*.whl")):
-        distribution = wheel.name.split("-", 1)[0]
-        previous = newest.get(distribution)
+        parts = wheel.stem.split("-")
+        if len(parts) < 5:
+            continue
+        distribution = parts[0]
+        compatibility = tuple(parts[-3:])
+        key = (distribution, compatibility)
+        previous = newest.get(key)
         if previous is None:
-            newest[distribution] = wheel
+            newest[key] = wheel
             continue
         try:
             older, newer = sorted((previous, wheel), key=lambda path: _version_key(path.name))
@@ -139,7 +145,7 @@ def drop_superseded_wheels(destination):
             continue
         print(f"Removing superseded wheel {older.name}")
         older.unlink()
-        newest[distribution] = newer
+        newest[key] = newer
     return tuple(sorted(newest.values()))
 
 

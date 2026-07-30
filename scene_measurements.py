@@ -187,6 +187,7 @@ def scene_measurement_scene_properties():
         "scientia_label_plane_area",
         "scientia_label_plane_fit_error",
         "scientia_label_trace_length",
+        "scientia_label_trace_span",
         "scientia_label_trace_segments",
         "scientia_label_trace_mean_segment",
         "scientia_label_trace_sinuosity",
@@ -332,6 +333,11 @@ def define_scene_measurement_properties():
     bpy.types.Scene.scientia_label_trace_length = BoolProperty(
         name="Trace Length",
         description="Show the summed length of every segment of the trace",
+        default=True,
+    )
+    bpy.types.Scene.scientia_label_trace_span = BoolProperty(
+        name="End-to-End Distance",
+        description="Show the straight 3D distance from the first trace point to the last",
         default=True,
     )
     bpy.types.Scene.scientia_label_trace_segments = BoolProperty(name="Segments", default=False)
@@ -521,18 +527,37 @@ def kind_from_point_count(point_count):
     return "POLYLINE"
 
 
+def kind_accepts_point_count(kind, point_count):
+    """Whether moving coordinates can keep an existing semantic kind.
+
+    Point edits do not change topology.  In particular, a trace is still an
+    open trace after one of its points moves; classifying it again only from
+    the number of points silently turns it into a line, plane, or polygon.
+    """
+    kind = str(kind or "").upper()
+    if kind == "LINEAR":
+        return point_count == 2
+    if kind == "PLANE":
+        return point_count == 3
+    if kind == "POLYLINE":
+        return point_count >= 3
+    if kind == "TRACE":
+        return point_count >= 2
+    return False
+
+
 def set_scene_measurement_points(measurement, points, kind=None):
     measurement.points.clear()
     for point in points:
         item = measurement.points.add()
         item.co = (float(point[0]), float(point[1]), float(point[2]))
     if kind is None:
-        # Editing a point must not silently change POLYLINE into PLANE.
-        current = str(getattr(measurement, "kind", "") or "")
-        if current == "POLYLINE" and len(points) >= 3:
-            kind = "POLYLINE"
-        else:
-            kind = kind_from_point_count(len(points))
+        # Coordinate-only edits preserve every compatible semantic type.
+        # A real topology change (the linear tool pulling a third point out of
+        # a two-point line) still deliberately falls back to point-count
+        # classification and becomes a plane.
+        current = str(getattr(measurement, "kind", "") or "").upper()
+        kind = current if kind_accepts_point_count(current, len(points)) else kind_from_point_count(len(points))
     measurement.kind = kind
     bump_measurement_revision()
 

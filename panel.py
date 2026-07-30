@@ -104,8 +104,8 @@ class MeasurementExporterPanel(Panel):
         _draw_azimuth_panel(layout, scene)
 
 
-# Chart dependencies are checked by importing them, which is too slow to repeat
-# on every panel redraw, so the answer is cached until something changes it.
+# Panel drawing only inspects module specifications; importing chart libraries
+# is performed by the timeout-protected background checker.
 _DEPENDENCY_CACHE_TTL_SECONDS = 5.0
 _dependency_cache = {"time": 0.0, "missing": None}
 
@@ -135,29 +135,38 @@ def _draw_dependency_banner(layout):
     Without this the only sign of a failed install is a line in the system
     console, which most users never open.
     """
-    from . import operators
+    from . import dependencies, operators
 
     state = operators.install_state()
     if state.get("status") == "running":
         box = layout.box()
-        box.label(text="Installing chart packages...", icon='SORTTIME')
-        box.label(text="Blender stays usable; this can take a few minutes.")
+        box.label(text="Preparing chart packages — please wait", icon='SORTTIME')
+        message = str(state.get("message") or "Working…")
+        box.label(text=message[:110])
+        elapsed = int(float(state.get("elapsed", 0.0) or 0.0))
+        box.label(text=f"Elapsed: {elapsed} s. Blender remains usable.")
         return
 
     missing = _missing_chart_packages()
     if not missing:
-        if state.get("status") == "ok":
-            invalidate_dependency_cache()
+        if state.get("status") == "ok" and state.get("show_completion"):
+            box = layout.box()
+            box.label(text="Chart package installation finished", icon='CHECKMARK')
+            box.label(text="Histogram and stereonet are ready.")
         return
 
     box = layout.box()
     box.label(text="Charts unavailable", icon='ERROR')
     box.label(text="Missing: " + ", ".join(missing))
     column = box.column(align=True)
-    column.operator("wm.scientia_install_dependencies", icon='IMPORT')
+    if dependencies.installed_as_extension():
+        box.label(text="Repair or reinstall the Extension to restore its bundled packages.")
+    else:
+        column.operator("wm.scientia_install_dependencies", icon='IMPORT')
     column.operator("wm.scientia_diagnostics", text="Diagnostics", icon='INFO')
     if state.get("status") == "failed" and state.get("message"):
-        box.label(text=state["message"], icon='CANCEL')
+        box.label(text=str(state["message"])[:110], icon='CANCEL')
+        box.label(text="Open Diagnostics to see the failing stage and source.")
 
 
 def _draw_visualization_buttons(layout, context):
@@ -529,9 +538,11 @@ def _draw_label_field_settings(layout, scene):
     layout.label(text="Trace", icon=TRACE_ICON)
     row = layout.row(align=True)
     row.prop(scene, "scientia_label_trace_length", text="Length", toggle=True)
-    row.prop(scene, "scientia_label_trace_segments", text="Segments", toggle=True)
+    row.prop(scene, "scientia_label_trace_span", text="End Distance", toggle=True)
     row = layout.row(align=True)
+    row.prop(scene, "scientia_label_trace_segments", text="Segments", toggle=True)
     row.prop(scene, "scientia_label_trace_mean_segment", text="Mean Seg", toggle=True)
+    row = layout.row(align=True)
     row.prop(scene, "scientia_label_trace_sinuosity", text="Sinuosity", toggle=True)
     row.prop(scene, "scientia_label_trace_azimuth", text="Az", toggle=True)
 
@@ -613,10 +624,11 @@ def _draw_trace_record_info(layout, record):
         if segments:
             row.label(text=f"Min {min(segments):.3f}")
             row.label(text=f"Max {max(segments):.3f}")
-    if record.span_length:
+    if record.span_length is not None:
         row = layout.row(align=True)
         row.label(text=f"Span {record.span_length:.3f}")
-        row.label(text=f"Sinuosity {record.length / record.span_length:.2f}")
+        if record.span_length > 0.0:
+            row.label(text=f"Sinuosity {record.length / record.span_length:.2f}")
     if line is not None:
         row = layout.row(align=True)
         row.label(text=f"Az {line.rotated_azimuth:.1f}")

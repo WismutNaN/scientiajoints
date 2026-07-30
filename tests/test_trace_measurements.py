@@ -8,6 +8,7 @@ difference is the whole reason the type exists.
 import csv
 import math
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -165,6 +166,40 @@ class TraceOverlayTests(unittest.TestCase):
         self.assertFalse(self.tool._measurement_kind_visible(hidden, trace))
         self.assertTrue(self.tool._measurement_kind_visible(shown, trace))
 
+    def test_the_visibility_cache_keys_change_with_the_trace_toggle(self):
+        common = dict(
+            scientia_measurements=(),
+            scientia_active_measurement_index=-1,
+            scientia_measure_show_linear=True,
+            scientia_measure_show_planes=True,
+            scientia_measure_no_code_visible=True,
+            scientia_measurement_codes=(),
+        )
+        shown = _Scene(scientia_measure_show_traces=True, **common)
+        hidden = _Scene(scientia_measure_show_traces=False, **common)
+
+        self.assertNotEqual(
+            self.tool._geometry_cache_key(shown, 0.25),
+            self.tool._geometry_cache_key(hidden, 0.25),
+        )
+        self.assertNotEqual(
+            self.tool._anchor_cache_key(shown, {}),
+            self.tool._anchor_cache_key(hidden, {}),
+        )
+
+    def test_hiding_all_traces_also_hides_the_active_trace(self):
+        trace = _Measurement("TRACE")
+        scene = _Scene(
+            scientia_active_measurement_index=0,
+            scientia_measure_show_traces=False,
+        )
+
+        self.assertFalse(self.tool._measurement_visible(scene, trace, index=0, code_styles={}))
+        self.assertEqual(
+            self.tool._budgeted_indices(scene, (), (), active_index=0, hover_index=0),
+            [],
+        )
+
     def test_hiding_traces_leaves_the_other_kinds_alone(self):
         scene = _Scene(
             scientia_measure_show_traces=False,
@@ -197,6 +232,85 @@ class TraceOverlayTests(unittest.TestCase):
         self.assertEqual(trace.measurement_kind, "TRACE")
         self.assertEqual(trace.minimum_points, 2, "two points already make a trace")
         self.assertEqual(polygon.minimum_points, 3)
+
+    def test_each_tool_only_edits_measurement_kinds_it_understands(self):
+        trace = _Measurement("TRACE", 2)
+        polygon = _Measurement("POLYLINE", 4)
+        linear = _Measurement("LINEAR", 2)
+
+        self.assertFalse(self.tool._measurement_kind_in(
+            trace, self.tool.ScientiaMeasureDragOperator.editable_kinds
+        ))
+        self.assertFalse(self.tool._measurement_kind_in(
+            trace, self.tool.ScientiaPolygonMeasureOperator.editable_kinds
+        ))
+        self.assertTrue(self.tool._measurement_kind_in(
+            trace, self.tool.ScientiaTraceMeasureOperator.editable_kinds
+        ))
+        self.assertTrue(self.tool._measurement_kind_in(
+            polygon, self.tool.ScientiaMeasureDragOperator.editable_kinds
+        ))
+        self.assertTrue(self.tool._measurement_kind_in(
+            linear, self.tool.ScientiaMeasureDragOperator.editable_kinds
+        ))
+
+    def test_trace_labels_show_total_length_and_end_to_end_distance(self):
+        points = [
+            self.tool.Vector((0, 0, 0)),
+            self.tool.Vector((3, 0, 0)),
+            self.tool.Vector((3, 4, 0)),
+        ]
+        measurement = types.SimpleNamespace(uuid="trace-1", layer="Default", code="", name="", description="")
+        scene = _Scene(
+            az_real=0.0,
+            az_model=0.0,
+            scientia_label_trace_length=True,
+            scientia_label_trace_span=True,
+        )
+
+        lines = self.tool._trace_label_lines(points, scene, measurement)
+
+        self.assertIn("trace 7.000", lines)
+        self.assertIn("end distance 5.000", lines)
+
+    def test_trace_span_can_be_hidden_without_hiding_total_length(self):
+        points = [self.tool.Vector((0, 0, 0)), self.tool.Vector((0, 5, 0))]
+        measurement = types.SimpleNamespace(uuid="trace-1", layer="Default", code="", name="", description="")
+        scene = _Scene(
+            az_real=0.0,
+            az_model=0.0,
+            scientia_label_trace_length=True,
+            scientia_label_trace_span=False,
+        )
+
+        lines = self.tool._trace_label_lines(points, scene, measurement)
+
+        self.assertIn("trace 5.000", lines)
+        self.assertFalse(any(line.startswith("end distance") for line in lines))
+
+    def test_active_trace_record_dispatches_by_kind_not_point_count(self):
+        measurement = types.SimpleNamespace(
+            kind="TRACE",
+            uuid="trace-1",
+            layer="Default",
+            points=(
+                types.SimpleNamespace(co=(0, 0, 0)),
+                types.SimpleNamespace(co=(3, 0, 0)),
+                types.SimpleNamespace(co=(3, 4, 0)),
+            ),
+        )
+        scene = _Scene(
+            scientia_active_measurement_index=0,
+            scientia_measurements=(measurement,),
+            az_real=0.0,
+            az_model=0.0,
+        )
+
+        record = self.tool.active_measurement_record(scene)
+
+        self.assertEqual(record.kind, self.tool.MeasurementKind.TRACE)
+        self.assertAlmostEqual(record.length, 7.0)
+        self.assertAlmostEqual(record.span_length, 5.0)
 
     def test_the_trace_tool_has_its_own_toolbar_entry_and_icon(self):
         tool = self.tool.ScientiaTraceMeasureWorkSpaceTool
