@@ -2455,15 +2455,24 @@ def _code_visible(scene, code, code_styles):
 
 
 def _measurement_visible(scene, measurement, index=None, code_styles=None):
-    # Global kind switches mean "all": an active or hovered trace must not be
-    # smuggled back into the draw budget after traces were hidden.
-    if not _measurement_kind_visible(scene, measurement):
-        return False
-    # Keep an active measurement visible through a code-group change so its
-    # handles do not vanish during a coordinate edit. Kind switches above are
-    # explicit global display commands and therefore take priority.
+    """Whether a stored measurement is drawn and can be picked.
+
+    The active measurement is exempt from every filter, kind and code group
+    alike. Scientia Measure builds a plane in two steps: a two-point linear
+    measurement first, then a third point dragged out of its midpoint. The hit
+    test calls this same function, so filtering the active measurement by kind
+    left that intermediate state invisible and unpickable, and the plane could
+    never be finished while linear measurements were hidden.
+
+    One measurement of a hidden kind therefore stays on screen. It is the one
+    being worked on, and the alternative is a tool that stops halfway.
+    ``_budgeted_indices`` keeps the rest out: it forces an index into the draw
+    budget only when this function already passed it.
+    """
     if index is not None and index == getattr(scene, "scientia_active_measurement_index", -1):
         return True
+    if not _measurement_kind_visible(scene, measurement):
+        return False
     if not _code_visible(scene, getattr(measurement, "code", ""), code_styles):
         return False
     return True

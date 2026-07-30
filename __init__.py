@@ -4,7 +4,7 @@
 bl_info = {
     "name": "ScientiaJoints",
     "author": "Scientia, Ivan Guzeev",
-    "version": (3, 4, 7),
+    "version": (3, 4, 8),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > ScientiaJoints",
     "description": "Export measurements with visualizations and adjustable settings",

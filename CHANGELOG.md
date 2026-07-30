@@ -4,6 +4,10 @@ All notable changes to ScientiaJoints are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a kind visibility toggle hiding the measurement being built. Scientia Measure creates a plane in two steps: a two-point linear measurement first, then a third point dragged out of its midpoint. With `Linear` switched off the intermediate state was filtered out, and because the hit test uses the same visibility check it was also unpickable, so the plane could never be finished. The active measurement is now exempt from the kind filter, matching what the code group filter already did. One measurement of a hidden kind stays on screen as a result: the one being worked on. The rest are unaffected, because the draw budget forces an index into itself only when the filter already passed it.
+
 ### Added
 
 - Added a trace measurement type and the `Scientia Trace` tool that creates it. A trace is an open polyline along a fracture: its length is the sum of its segments, which is what separates it from a linear measurement between the same two end points. The tool works like the polygon tool with the closing taken out - click along the trace, right click, Enter or Space to finish, Backspace to undo a point - and two points already make one. It has its own toolbar icon and never gets the area fill or the angle arc, because it encloses nothing.

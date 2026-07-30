@@ -187,17 +187,46 @@ class TraceOverlayTests(unittest.TestCase):
             self.tool._anchor_cache_key(hidden, {}),
         )
 
-    def test_hiding_all_traces_also_hides_the_active_trace(self):
-        trace = _Measurement("TRACE")
+    def test_hiding_a_kind_keeps_the_active_measurement_of_that_kind(self):
+        """The measurement being worked on survives every filter.
+
+        Scientia Measure builds a plane from a two-point linear measurement, so
+        filtering the active one by kind left the half-built plane invisible and
+        unpickable while linear measurements were hidden.
+        """
+        scene = _Scene(
+            scientia_active_measurement_index=0,
+            scientia_measure_show_traces=False,
+            scientia_measure_show_linear=False,
+            scientia_measure_show_planes=False,
+        )
+
+        for kind, points in (("TRACE", 4), ("LINEAR", 2), ("POLYLINE", 5)):
+            with self.subTest(kind=kind):
+                measurement = _Measurement(kind, point_count=points)
+                self.assertTrue(
+                    self.tool._measurement_visible(scene, measurement, index=0, code_styles={})
+                )
+                self.assertFalse(
+                    self.tool._measurement_visible(scene, measurement, index=1, code_styles={}),
+                    "only the active measurement is exempt",
+                )
+
+    def test_a_hidden_kind_is_never_forced_into_the_draw_budget(self):
+        """`_budgeted_indices` forces an index only when the filters passed it,
+        so hiding a kind still clears everything except the active measurement."""
         scene = _Scene(
             scientia_active_measurement_index=0,
             scientia_measure_show_traces=False,
         )
 
-        self.assertFalse(self.tool._measurement_visible(scene, trace, index=0, code_styles={}))
         self.assertEqual(
             self.tool._budgeted_indices(scene, (), (), active_index=0, hover_index=0),
             [],
+        )
+        self.assertEqual(
+            self.tool._budgeted_indices(scene, (0,), (), active_index=0, hover_index=-1),
+            [0],
         )
 
     def test_hiding_traces_leaves_the_other_kinds_alone(self):
