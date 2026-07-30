@@ -68,10 +68,14 @@ class InspectionSettingsTests(unittest.TestCase):
         self.assertGreater(self.operators.RAKING_LIGHT_ELEVATION_DEGREES, 0.0)
         self.assertLess(self.operators.RAKING_LIGHT_ELEVATION_DEGREES, 45.0)
 
-    def test_ambient_light_stays_below_the_sun(self):
-        """Ambient fills the shadows the sun creates, so it cannot dominate."""
-        self.assertLess(self.operators.INSPECTION_WORLD_STRENGTH, 0.5)
+    def test_the_sun_stays_stronger_than_the_ambient_fill(self):
+        """Ambient sets the base brightness so the texture reads everywhere, and
+        the sun has to stay above it or there is no relief left - only an even
+        wash with no shadow to show a fracture by."""
         self.assertGreater(self.operators.INSPECTION_WORLD_STRENGTH, 0.0)
+        self.assertGreater(
+            self.operators.RAKING_LIGHT_ENERGY, self.operators.INSPECTION_WORLD_STRENGTH
+        )
 
     def test_the_surface_is_matte_and_barely_specular(self):
         """A highlight on wet rock hides the texture the structure is read from."""

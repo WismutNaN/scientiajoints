@@ -838,9 +838,10 @@ RAKING_LIGHT_ENERGY = 6.0
 #: casts something to see.
 RAKING_LIGHT_ANGLE_DEGREES = 0.5
 
-#: Ambient light fills the shadows the sun creates, so it has to stay low or the
-#: contrast the sun bought is paid straight back. Not zero: a fracture that is
-#: pure black shows its outline but nothing inside it.
+#: Ambient carries the base brightness, so the surface reads evenly and its
+#: texture is visible everywhere rather than only where the sun falls. It does
+#: fill the shadows the sun creates, which is why the sun below is set well
+#: above it: relief comes from the difference between the two.
 INSPECTION_WORLD_STRENGTH = 1.5
 
 #: Matte, so no highlight washes out the texture the structure is read from.

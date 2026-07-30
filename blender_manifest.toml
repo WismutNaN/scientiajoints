@@ -10,7 +10,7 @@ id = "scientiajoints"
 # The add-on version, and the only place it is set. Change it with
 # `python tools/version.py <new version>`, which also updates the bl_info copy
 # in __init__.py; editing either file by hand makes the build fail.
-version = "3.4.2"
+version = "3.4.3"
 name = "ScientiaJoints"
 tagline = "Fracture measurements with export, histograms and stereonets"
 maintainer = "Ivan Guzeev"

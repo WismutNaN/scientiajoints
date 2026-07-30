@@ -1,6 +1,21 @@
-# ScientiaJoints
+<p align="center">
+  <img src="docs/logo.png" alt="ScientiaJoints" width="140">
+</p>
+
+<h1 align="center">ScientiaJoints</h1>
+
+<p align="center">
+  A Blender add-on for mapping rock mass fracturing: measurements on a 3D model,<br>
+  statistics, stereonets and export.
+</p>
+
+<p align="center"><a href="README.ru.md">Русская версия</a></p>
+
+---
 
 ScientiaJoints is a Blender add-on for collecting fracture/joint measurements, exporting raw and processed data, and generating histograms and stereonets.
+
+![Example](screen.png)
 
 The add-on supports two measurement sources:
 

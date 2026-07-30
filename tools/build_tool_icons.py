@@ -385,6 +385,17 @@ def write_preview(path, size=64, background=(58, 58, 58), supersample=SUPERSAMPL
     return Path(path)
 
 
+def write_png(path, builder, size=512, supersample=SUPERSAMPLE):
+    """One shape builder to a transparent PNG. Used for the add-on logo, which
+    is artwork of the same kind but is not a toolbar icon."""
+    pixels = render(builder, size, supersample)
+    rows = [b"\x00" + bytes(value for pixel in row for value in pixel) for row in pixels]
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_png_bytes(rows, size, size, 6))
+    return path
+
+
 def write_pngs(directory, size=512, supersample=SUPERSAMPLE):
     """Write each icon as a standalone PNG with a transparent background.
 
