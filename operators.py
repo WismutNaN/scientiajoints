@@ -1,9 +1,15 @@
+import math
+
 import bpy
 from bpy.types import Operator
 from . import dependencies as deps
 from .dependencies import dependency_summary
 from .parser import MeasurementsParser
-from .visualization import update_histogram_image, update_stereonet_image
+from .visualization import (
+    update_histogram_image,
+    update_stereonet_image,
+    update_traces_histogram_image,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -616,6 +622,47 @@ class ShowHistogramImageOperator(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class ShowTracesHistogramImageOperator(bpy.types.Operator):
+    bl_idname = "wm.show_traces_histogram_image"
+    bl_label = "Open Trace Histogram"
+    bl_description = "Display the distribution of trace lengths, separately from linear measurements"
+
+    def execute(self, context):
+        try:
+            if not update_traces_histogram_image(context):
+                self.report({'WARNING'}, "No traces to plot, or the image was not created.")
+                return {'CANCELLED'}
+            logger.info("Traces histogram image displayed.")
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to display the trace histogram: {e}")
+            logger.error("Failed to display the trace histogram: %s", e, exc_info=True)
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class ExportProcessedTracesOperator(Operator):
+    bl_idname = "export.processed_traces"
+    bl_label = "Processed Traces"
+    bl_description = (
+        "Export traces to a CSV-file with the total length, the segment count, the mean, "
+        "smallest and largest segment, the straight span between the ends and the sinuosity"
+    )
+
+    def execute(self, context):
+        logger.info("Processing traces...")
+        try:
+            parser = MeasurementsParser()
+            result = parser.process_traces(
+                az_real=context.scene.az_real,
+                az_model=context.scene.az_model,
+            )
+            return _finish_export_operator(self, result)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to export processed traces: {e}")
+            logger.error("Failed to export processed traces: %s", e, exc_info=True)
+            return {'CANCELLED'}
+
+
 class ShowStereonetImageOperator(bpy.types.Operator):
     bl_idname = "wm.show_stereonet_image"
     bl_label = "Open Stereonet"
@@ -742,20 +789,171 @@ class RealTimeStereonetUpdateOperator(_RealTimeChartUpdateOperator):
         return update_stereonet_image(context, report_errors=report_errors)
 
 
+class RealTimeTracesUpdateOperator(_RealTimeChartUpdateOperator):
+    bl_idname = "wm.real_time_traces_update_operator"
+    bl_label = "Real-Time Trace Histogram Update Operator"
+    bl_description = ("Automatic chart update at a specified frequency. "
+                      "The frequency can be changed in the visualization settings, "
+                      "but only when the automatic update function is disabled.")
+
+    _running = False
+    scene_property = "real_time_update_traces"
+    label = "trace histogram"
+
+    def _update_chart(self, context, report_errors=False):
+        return update_traces_histogram_image(context, report_errors=report_errors)
+
+
 def reset_realtime_operators():
     """Clear the running flags after a file load or a re-registration."""
     RealTimeHistogramUpdateOperator._running = False
     RealTimeStereonetUpdateOperator._running = False
+    RealTimeTracesUpdateOperator._running = False
 
 
 # ============================================================
 # Toggle: Light / Camera / World / Material (Blender 5.0 safe)
 # ============================================================
 
+# ============================================================
+# Rock inspection lighting
+# ============================================================
+
+#: Name of the light the inspection mode adds, and removes again. Named so it is
+#: obvious in the outliner where it came from.
+RAKING_LIGHT_NAME = "ScientiaJoints Raking Light"
+
+#: A low sun grazing the surface is what makes relief readable: it throws every
+#: fracture, groove and step into shadow, where a light near the camera flattens
+#: them. The elevation is a compromise - lower reads more relief but loses whole
+#: faces to shadow.
+RAKING_LIGHT_ELEVATION_DEGREES = 22.0
+RAKING_LIGHT_AZIMUTH_DEGREES = 135.0
+#: Brightness comes from the sun before it comes from anywhere else. Being
+#: directional, raising it lifts the lit faces without lifting the shadows by
+#: the same amount, so the picture gets brighter and keeps its relief. Raising
+#: ambient instead would brighten both equally and flatten what the sun bought.
+RAKING_LIGHT_ENERGY = 6.0
+#: A near-parallel sun keeps shadow edges crisp, so a hairline fracture still
+#: casts something to see.
+RAKING_LIGHT_ANGLE_DEGREES = 0.5
+
+#: Ambient light fills the shadows the sun creates, so it has to stay low or the
+#: contrast the sun bought is paid straight back. Not zero: a fracture that is
+#: pure black shows its outline but nothing inside it.
+INSPECTION_WORLD_STRENGTH = 1.5
+
+#: Matte, so no highlight washes out the texture the structure is read from.
+INSPECTION_ROUGHNESS = 0.9
+INSPECTION_METALLIC = 0.0
+INSPECTION_SPECULAR = 0.05
+
+#: Looks worth using if the colour management config offers one, most contrast
+#: first. Absent from a background Blender, so this is always optional.
+PREFERRED_LOOKS = ("Punchy", "High Contrast", "Medium High Contrast")
+
+
+def _find_contrast_look(view_settings):
+    """A higher-contrast look from whatever the OCIO config actually has.
+
+    Looks are named after the view transform that owns them, as in
+    ``AgX - Punchy``, so the name is taken from after the last separator and
+    matched whole. Matching on a substring would pick ``Medium High Contrast``
+    when asked for ``High Contrast``, one preference below what was wanted.
+    """
+    try:
+        available = [item.identifier for item in view_settings.bl_rna.properties["look"].enum_items]
+    except Exception:
+        return ""
+
+    by_name = {}
+    for identifier in available:
+        name = identifier.rsplit(" - ", 1)[-1].strip().lower()
+        by_name.setdefault(name, identifier)
+
+    for wanted in PREFERRED_LOOKS:
+        identifier = by_name.get(wanted.lower())
+        if identifier is not None:
+            return identifier
+    return ""
+
+
+def _set_viewport_shading(context, shading_type):
+    """Put every 3D view into ``shading_type``; report what they were before."""
+    previous = ""
+    screens = getattr(getattr(context, "window_manager", None), "windows", ())
+    for window in screens:
+        for area in window.screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+            for space in area.spaces:
+                if space.type != 'VIEW_3D':
+                    continue
+                if not previous:
+                    previous = space.shading.type
+                try:
+                    space.shading.type = shading_type
+                except Exception as e:
+                    logger.debug("Could not set viewport shading: %s", e)
+    return previous
+
+
+def _add_raking_light(scene):
+    """Add the grazing sun, or reuse one left over from a previous run."""
+    existing = bpy.data.objects.get(RAKING_LIGHT_NAME)
+    if existing is not None:
+        return existing, False
+
+    light_data = bpy.data.lights.new(RAKING_LIGHT_NAME, type='SUN')
+    light_data.energy = RAKING_LIGHT_ENERGY
+    light_data.angle = math.radians(RAKING_LIGHT_ANGLE_DEGREES)
+    # No specular contribution at all: a highlight on wet or polished rock hides
+    # exactly the texture this mode exists to show.
+    if hasattr(light_data, "specular_factor"):
+        light_data.specular_factor = 0.0
+    if hasattr(light_data, "use_shadow"):
+        light_data.use_shadow = True
+
+    light_object = bpy.data.objects.new(RAKING_LIGHT_NAME, light_data)
+    # A sun points down its own -Z, so tilting X by 90 degrees minus the wanted
+    # elevation lays it over towards the horizon, and Z aims it.
+    light_object.rotation_euler = (
+        math.radians(90.0 - RAKING_LIGHT_ELEVATION_DEGREES),
+        0.0,
+        math.radians(RAKING_LIGHT_AZIMUTH_DEGREES),
+    )
+    scene.collection.objects.link(light_object)
+    return light_object, True
+
+
+def _remove_raking_light(name):
+    light_object = bpy.data.objects.get(name)
+    if light_object is None:
+        return
+    light_data = light_object.data
+    try:
+        bpy.data.objects.remove(light_object, do_unlink=True)
+    except Exception as e:
+        logger.debug("Could not remove the raking light object: %s", e)
+        return
+    # The light datablock outlives its object; drop it too so repeated toggles
+    # do not leave a pile of unused lights in the file.
+    try:
+        if light_data is not None and light_data.users == 0:
+            bpy.data.lights.remove(light_data)
+    except Exception as e:
+        logger.debug("Could not remove the raking light data: %s", e)
+
+
 class ToggleLightSettingsOperator(bpy.types.Operator):
     bl_idname = "wm.toggle_light_settings"
-    bl_label = "Toggle Light and Camera Settings"
-    bl_description = "Toggle between custom light, view, and camera settings, and default settings"
+    bl_label = "Toggle Rock Inspection View"
+    bl_description = (
+        "Switch the viewport to Rendered and light the model for reading rock structure: "
+        "a low raking sun that throws fractures into shadow, matte materials with no "
+        "specular glare, and low ambient light so the contrast survives. "
+        "Press again to restore the previous viewport shading, world, material and camera"
+    )
 
     def execute(self, context):
         scene = context.scene
@@ -818,6 +1016,8 @@ class ToggleLightSettingsOperator(bpy.types.Operator):
                 settings.clip_start = float(camera.clip_start)
                 settings.clip_end = float(camera.clip_end)
 
+            settings.view_look = str(getattr(scene.view_settings, "look", "") or "")
+
             # -----------------------------
             # Apply custom settings
             # -----------------------------
@@ -835,26 +1035,45 @@ class ToggleLightSettingsOperator(bpy.types.Operator):
             if eevee:
                 _set_first_attr(eevee, samples_names, 64)
                 _set_first_attr(eevee, ray_flag_names, True)
+                # Shadows and short-range indirect light are what put contrast
+                # into a crevice rather than filling it uniformly.
+                if hasattr(eevee, "use_shadows"):
+                    eevee.use_shadows = True
+                if hasattr(eevee, "use_fast_gi"):
+                    eevee.use_fast_gi = True
 
             scene.render.film_transparent = True
 
-            # World background: white + moderate strength
+            # Ambient stays low so the raking sun below decides the contrast.
             try:
                 bg_node.inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
-                bg_node.inputs[1].default_value = 0.5
+                bg_node.inputs[1].default_value = INSPECTION_WORLD_STRENGTH
             except Exception:
                 pass
 
-            # Material: matte, no specular
+            # Material: matte, no glare over the texture.
             try:
                 if metallic_input is not None:
-                    metallic_input.default_value = 0.0
+                    metallic_input.default_value = INSPECTION_METALLIC
                 if roughness_input is not None:
-                    roughness_input.default_value = 1.0
+                    roughness_input.default_value = INSPECTION_ROUGHNESS
                 if specular_input is not None:
-                    specular_input.default_value = 0.0
+                    specular_input.default_value = INSPECTION_SPECULAR
             except Exception:
                 pass
+
+            light_object, created = _add_raking_light(scene)
+            settings.created_light = RAKING_LIGHT_NAME if created else ""
+
+            look = _find_contrast_look(scene.view_settings)
+            if look:
+                try:
+                    scene.view_settings.look = look
+                except Exception as e:
+                    logger.debug("Could not set the colour management look: %s", e)
+
+            # Rendered shading last, so the first frame it draws is already lit.
+            settings.viewport_shading = _set_viewport_shading(context, 'RENDERED')
 
             # Camera defaults
             camera = scene.camera.data if scene.camera else None
@@ -901,6 +1120,20 @@ class ToggleLightSettingsOperator(bpy.types.Operator):
                 camera.lens = float(settings.focal_length)
                 camera.clip_start = float(settings.clip_start)
                 camera.clip_end = float(settings.clip_end)
+
+            if settings.created_light:
+                _remove_raking_light(settings.created_light)
+                settings.created_light = ""
+
+            if settings.view_look:
+                try:
+                    scene.view_settings.look = settings.view_look
+                except Exception as e:
+                    logger.debug("Could not restore the colour management look: %s", e)
+
+            if settings.viewport_shading:
+                _set_viewport_shading(context, settings.viewport_shading)
+                settings.viewport_shading = ""
 
             settings.is_custom_settings = False
 

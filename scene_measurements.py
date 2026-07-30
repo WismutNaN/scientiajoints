@@ -6,6 +6,7 @@ from bpy.props import (
     BoolProperty,
     CollectionProperty,
     EnumProperty,
+    FloatProperty,
     FloatVectorProperty,
     IntProperty,
     StringProperty,
@@ -15,11 +16,57 @@ from bpy.props import (
 MEASUREMENT_KIND_ITEMS = (
     ("LINEAR", "Linear", "Two-point distance measurement"),
     ("PLANE", "Plane", "Three-point plane measurement"),
-    ("POLYLINE", "Polyline", "Multi-point measurement for future averaged planes"),
+    ("POLYLINE", "Polyline", "Closed multi-point outline fitted to an averaged plane"),
+    ("TRACE", "Trace", "Open multi-point polyline along a fracture trace, measured by total length"),
 )
+
+#: Blender icons for the kind toggles, in one place so the tool header and the
+#: sidebar cannot drift apart. Chosen for what they look like at 16 px: a
+#: dimension between two points, a flat quad, and a zigzag polyline.
+LINEAR_ICON = "DRIVER_DISTANCE"
+PLANE_ICON = "MESH_PLANE"
+TRACE_ICON = "MOD_SIMPLIFY"
 
 DEFAULT_MEASUREMENT_COLOR = (0.1, 0.65, 1.0, 1.0)
 ACTIVE_MEASUREMENT_COLOR = (1.0, 0.9, 0.2, 1.0)
+
+#: Viewport overlay style. The defaults reproduce the sizes the overlay used
+#: before they were adjustable, so an existing scene looks unchanged.
+DEFAULT_LINE_WIDTH = 2.0
+MIN_LINE_WIDTH = 0.5
+MAX_LINE_WIDTH = 10.0
+DEFAULT_POINT_SIZE = 8.0
+MIN_POINT_SIZE = 2.0
+MAX_POINT_SIZE = 24.0
+DEFAULT_FILL_ALPHA = 0.25
+DEFAULT_LABEL_SIZE = 12.0
+MIN_LABEL_SIZE = 6.0
+MAX_LABEL_SIZE = 48.0
+
+#: Per-redraw budgets for the screen-space overlay. Lines and fills are built
+#: once and cached, but handles and labels live in screen space and have to be
+#: rebuilt every frame, so their cost is what decides whether a large scene
+#: stays interactive. Past a few thousand handles nothing on screen is legible
+#: anyway; drawing them only spends frame time to produce a smear.
+DEFAULT_MAX_HANDLE_POINTS = 2000
+DEFAULT_MAX_LABELS = 200
+
+
+#: Bumped whenever the measurement collection changes shape or contents.
+#: The viewport overlay caches world-space geometry and needs to know when to
+#: throw it away; hashing every point of every measurement per redraw would
+#: cost as much as rebuilding, so the mutating helpers say so instead.
+_revision = 0
+
+
+def bump_measurement_revision():
+    global _revision
+    _revision += 1
+    return _revision
+
+
+def measurement_revision():
+    return _revision
 
 
 def _on_measurement_code_update(self, context):
@@ -107,9 +154,18 @@ def scene_measurement_scene_properties():
         "scientia_measure_label_background",
         "scientia_measure_reuse_last_code",
         "scientia_measure_snap_by_default",
-        "scientia_measure_show_all_handles",
+        "scientia_measure_line_width",
+        "scientia_measure_show_points",
+        "scientia_measure_point_size",
+        "scientia_measure_fill_planes",
+        "scientia_measure_fill_alpha",
+        "scientia_measure_label_size",
+        "scientia_measure_label_at_center",
+        "scientia_measure_max_handle_points",
+        "scientia_measure_max_labels",
         "scientia_measure_show_linear",
         "scientia_measure_show_planes",
+        "scientia_measure_show_traces",
         "scientia_measure_no_code_visible",
         "scientia_measure_default_color",
         "scientia_measure_active_color",
@@ -130,6 +186,11 @@ def scene_measurement_scene_properties():
         "scientia_label_plane_angle",
         "scientia_label_plane_area",
         "scientia_label_plane_fit_error",
+        "scientia_label_trace_length",
+        "scientia_label_trace_segments",
+        "scientia_label_trace_mean_segment",
+        "scientia_label_trace_sinuosity",
+        "scientia_label_trace_azimuth",
     )
 
 
@@ -143,7 +204,78 @@ def define_scene_measurement_properties():
     bpy.types.Scene.scientia_measure_label_background = BoolProperty(name="Label Background", default=True)
     bpy.types.Scene.scientia_measure_reuse_last_code = BoolProperty(name="Reuse Previous Code", default=True)
     bpy.types.Scene.scientia_measure_snap_by_default = BoolProperty(name="Snap by Default", default=False)
-    bpy.types.Scene.scientia_measure_show_all_handles = BoolProperty(name="All Point Handles", default=False)
+    bpy.types.Scene.scientia_measure_line_width = FloatProperty(
+        name="Line Width",
+        description="Thickness of measurement lines and point outlines, in pixels",
+        default=DEFAULT_LINE_WIDTH,
+        min=MIN_LINE_WIDTH,
+        max=MAX_LINE_WIDTH,
+        step=10,
+        precision=1,
+    )
+    bpy.types.Scene.scientia_measure_show_points = BoolProperty(
+        name="All Points",
+        description="Draw a handle on every point of every measurement. Switch off to keep the "
+                    "handles of the active and hovered measurement only, which is quicker to draw "
+                    "and less cluttered on a dense scene; a measurement always stays editable",
+        default=True,
+    )
+    bpy.types.Scene.scientia_measure_point_size = FloatProperty(
+        name="Point Size",
+        description="Diameter of the point handles, in pixels",
+        default=DEFAULT_POINT_SIZE,
+        min=MIN_POINT_SIZE,
+        max=MAX_POINT_SIZE,
+        step=25,
+        precision=1,
+    )
+    bpy.types.Scene.scientia_measure_fill_planes = BoolProperty(
+        name="Fill Areas",
+        description="Fill plane and polygon measurements with a translucent surface, so an area "
+                    "reads as a surface instead of an outline",
+        default=True,
+    )
+    bpy.types.Scene.scientia_measure_label_size = FloatProperty(
+        name="Label Size",
+        description="Text size of the measurement labels, in pixels",
+        default=DEFAULT_LABEL_SIZE,
+        min=MIN_LABEL_SIZE,
+        max=MAX_LABEL_SIZE,
+        step=25,
+        precision=1,
+    )
+    bpy.types.Scene.scientia_measure_label_at_center = BoolProperty(
+        name="Label at Area Center",
+        description="Put the label of a plane or polygon measurement in the middle of its surface. "
+                    "Switch off to keep it on the corner point the measurement hinges on",
+        default=True,
+    )
+    bpy.types.Scene.scientia_measure_max_handle_points = IntProperty(
+        name="Handle Budget",
+        description="How many point handles the viewport draws per redraw. The ones nearest the "
+                    "middle of the view are kept, along with the active and hovered measurement. "
+                    "Raise it if you need to see more at once, lower it if the viewport lags",
+        default=DEFAULT_MAX_HANDLE_POINTS,
+        min=0,
+        soft_max=20000,
+    )
+    bpy.types.Scene.scientia_measure_max_labels = IntProperty(
+        name="Label Budget",
+        description="How many labels the viewport draws per redraw, nearest the middle of the view "
+                    "first. Labels are the most expensive part of the overlay and the first to "
+                    "become unreadable when they overlap",
+        default=DEFAULT_MAX_LABELS,
+        min=0,
+        soft_max=5000,
+    )
+    bpy.types.Scene.scientia_measure_fill_alpha = FloatProperty(
+        name="Fill Opacity",
+        description="Opacity of the area fill. 0 is invisible, 1 hides the geometry behind it",
+        default=DEFAULT_FILL_ALPHA,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+    )
     bpy.types.Scene.scientia_measure_show_linear = BoolProperty(
         name="Show Linear Measurements",
         description="Show 2-point distance measurements in the viewport (display only; export is not affected)",
@@ -152,6 +284,11 @@ def define_scene_measurement_properties():
     bpy.types.Scene.scientia_measure_show_planes = BoolProperty(
         name="Show Plane Measurements",
         description="Show plane and polygon measurements in the viewport (display only; export is not affected)",
+        default=True,
+    )
+    bpy.types.Scene.scientia_measure_show_traces = BoolProperty(
+        name="Show Trace Measurements",
+        description="Show open trace polylines in the viewport (display only; export is not affected)",
         default=True,
     )
     bpy.types.Scene.scientia_measure_no_code_visible = BoolProperty(name="No Code Visible", default=True)
@@ -192,6 +329,19 @@ def define_scene_measurement_properties():
         description="Show the RMS distance of polygon points from the fitted plane on the measurement label",
         default=True,
     )
+    bpy.types.Scene.scientia_label_trace_length = BoolProperty(
+        name="Trace Length",
+        description="Show the summed length of every segment of the trace",
+        default=True,
+    )
+    bpy.types.Scene.scientia_label_trace_segments = BoolProperty(name="Segments", default=False)
+    bpy.types.Scene.scientia_label_trace_mean_segment = BoolProperty(name="Mean Segment", default=False)
+    bpy.types.Scene.scientia_label_trace_sinuosity = BoolProperty(
+        name="Sinuosity",
+        description="Trace length divided by the straight distance between its ends: how far it wanders",
+        default=False,
+    )
+    bpy.types.Scene.scientia_label_trace_azimuth = BoolProperty(name="Trace Azimuth", default=False)
 
 
 def ensure_default_scene_measure_layer(scene):
@@ -226,6 +376,54 @@ def scene_measure_default_color(scene):
 
 def scene_measure_active_color(scene):
     return tuple(getattr(scene, "scientia_measure_active_color", ACTIVE_MEASUREMENT_COLOR))
+
+
+def _clamped_float(scene, name, default, minimum, maximum):
+    """Read an overlay style value defensively.
+
+    The viewport draw handlers run on every redraw, including before the
+    properties exist - an add-on reload leaves the handler registered for a
+    moment longer than the Scene properties - and a value out of range would
+    ask the GPU for a line width it cannot draw.
+    """
+    try:
+        value = float(getattr(scene, name, default))
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def scene_measure_line_width(scene):
+    return _clamped_float(
+        scene, "scientia_measure_line_width", DEFAULT_LINE_WIDTH, MIN_LINE_WIDTH, MAX_LINE_WIDTH
+    )
+
+
+def scene_measure_point_size(scene):
+    return _clamped_float(
+        scene, "scientia_measure_point_size", DEFAULT_POINT_SIZE, MIN_POINT_SIZE, MAX_POINT_SIZE
+    )
+
+
+def scene_measure_points_visible(scene):
+    return bool(getattr(scene, "scientia_measure_show_points", True))
+
+
+def scene_measure_label_size(scene):
+    return _clamped_float(
+        scene, "scientia_measure_label_size", DEFAULT_LABEL_SIZE, MIN_LABEL_SIZE, MAX_LABEL_SIZE
+    )
+
+
+def scene_measure_label_at_center(scene):
+    return bool(getattr(scene, "scientia_measure_label_at_center", True))
+
+
+def scene_measure_fill_alpha(scene):
+    """Opacity for area fills, or 0 when the fill is switched off."""
+    if not getattr(scene, "scientia_measure_fill_planes", True):
+        return 0.0
+    return _clamped_float(scene, "scientia_measure_fill_alpha", DEFAULT_FILL_ALPHA, 0.0, 1.0)
 
 
 def ensure_scene_measurement_code(scene, code, color=None):
@@ -278,6 +476,19 @@ def scene_measurement_code_color(scene, code):
     return None
 
 
+def scene_measurement_code_styles(scene):
+    """``{code: (color, visible)}`` for every defined fracture code.
+
+    The lookups below scan the code collection, which is fine for a panel row
+    and quadratic for a viewport redraw that asks once per measurement. Callers
+    that walk every measurement build this once instead.
+    """
+    styles = {}
+    for item in getattr(scene, "scientia_measurement_codes", ()) or ():
+        styles[item.name] = (tuple(item.color), bool(getattr(item, "visible", True)))
+    return styles
+
+
 def scene_measurement_code_visible(scene, code):
     code = (code or "").strip()
     if not code:
@@ -323,6 +534,7 @@ def set_scene_measurement_points(measurement, points, kind=None):
         else:
             kind = kind_from_point_count(len(points))
     measurement.kind = kind
+    bump_measurement_revision()
 
 
 def next_measurement_name(scene, prefix="M"):
@@ -361,6 +573,7 @@ def add_scene_measurement(scene, points, kind=None, layer=None, color=None, name
     scene.scientia_active_measurement_index = len(scene.scientia_measurements) - 1
     for index, item in enumerate(scene.scientia_measurements):
         item.selected = index == scene.scientia_active_measurement_index
+    bump_measurement_revision()
     return measurement
 
 
@@ -374,6 +587,7 @@ def delete_active_scene_measurement(scene):
     measurements.remove(index)
     scene.scientia_active_measurement_index = min(index, len(measurements) - 1)
     sync_scene_measurement_codes(scene)
+    bump_measurement_revision()
     return True
 
 

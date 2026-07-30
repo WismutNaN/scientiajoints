@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import sys
 import types
 from pathlib import Path
@@ -8,8 +9,62 @@ ADDON_DIR = Path(__file__).resolve().parents[1]
 
 
 class Vector:
+    """Stand-in for ``mathutils.Vector``.
+
+    It carries the arithmetic the add-on's drawing code performs on points, so
+    geometry helpers can be exercised without Blender. Anything beyond that is
+    deliberately absent: a stub that silently answers more than it models hides
+    the difference from the real thing rather than exposing it.
+    """
+
     def __init__(self, xyz):
-        self.x, self.y, self.z = xyz
+        self.x, self.y, self.z = (float(value) for value in xyz)
+
+    def copy(self):
+        return Vector((self.x, self.y, self.z))
+
+    def __iter__(self):
+        return iter((self.x, self.y, self.z))
+
+    def __getitem__(self, index):
+        return (self.x, self.y, self.z)[index]
+
+    def __eq__(self, other):
+        return isinstance(other, Vector) and tuple(self) == tuple(other)
+
+    def __hash__(self):
+        return hash(tuple(self))
+
+    def __repr__(self):
+        return f"Vector(({self.x}, {self.y}, {self.z}))"
+
+    def __add__(self, other):
+        return Vector((self.x + other.x, self.y + other.y, self.z + other.z))
+
+    def __sub__(self, other):
+        return Vector((self.x - other.x, self.y - other.y, self.z - other.z))
+
+    def __mul__(self, scalar):
+        return Vector((self.x * scalar, self.y * scalar, self.z * scalar))
+
+    __rmul__ = __mul__
+
+    def __truediv__(self, scalar):
+        return Vector((self.x / scalar, self.y / scalar, self.z / scalar))
+
+    def cross(self, other):
+        return Vector((
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x,
+        ))
+
+    def dot(self, other):
+        return self.x * other.x + self.y * other.y + self.z * other.z
+
+    @property
+    def length(self):
+        return math.sqrt(self.dot(self))
 
 
 def install_mathutils_stub():

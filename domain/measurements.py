@@ -6,6 +6,10 @@ from typing import Mapping, Optional, Tuple
 class MeasurementKind(str, Enum):
     LINEAR = "linear"
     PLANE = "plane"
+    #: An open polyline following a fracture trace across a surface. Its length
+    #: is the sum of its segments, which is what makes it different from a
+    #: LINEAR measurement between the same two end points.
+    TRACE = "trace"
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,15 @@ class MeasurementRecord:
     length: Optional[float] = None
     area: Optional[float] = None
     degree: Optional[float] = None
+    #: Trace measurements only. ``length`` carries the summed segment length,
+    #: and these describe how that total is made up.
+    segment_count: Optional[int] = None
+    segment_lengths: Tuple[float, ...] = ()
+    mean_segment_length: Optional[float] = None
+    #: Straight distance between the first and last point. Dividing ``length``
+    #: by it gives the sinuosity, which is how far the trace wanders from a
+    #: straight line between its ends.
+    span_length: Optional[float] = None
     fit_error: Optional[float] = None
     fit_error_relative: Optional[float] = None
     #: Empty when the points define a plane. Otherwise a short reason why the
@@ -142,3 +155,7 @@ class MeasurementSet:
     @property
     def faces(self):
         return tuple(m for m in self.raw_measurements if m.kind == MeasurementKind.PLANE)
+
+    @property
+    def traces(self):
+        return tuple(m for m in self.raw_measurements if m.kind == MeasurementKind.TRACE)

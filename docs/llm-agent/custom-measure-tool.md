@@ -67,8 +67,12 @@
   - helpers: `add_scene_measurement()`, `set_scene_measurement_points()`, `delete_active_scene_measurement()`
 - `custom_measure_tool.py`
   - `ScientiaMeasureWorkSpaceTool`
+  - `ScientiaTraceMeasureWorkSpaceTool`
   - `ScientiaMeasureDragOperator`
+  - `ScientiaTraceMeasureOperator`
   - `ScientiaDeleteActiveMeasurementOperator`
+  - `draw_tool_header()` - общий ряд настроек в tool header для всех трёх инструментов
+  - `LINEAR_ICON` / `PLANE_ICON` / `TRACE_ICON` в `scene_measurements.py` - один источник иконок для tool header и боковой панели
   - `tool_icon()` - `bl_icon` для обоих tools. Blender резолвит `bl_icon` как `os.path.join(<blender datafiles>/icons, bl_icon + ".dat")`, а `os.path.join` отбрасывает первый аргумент при абсолютном втором, поэтому аддон отдает абсолютный путь в свой `icons/`. Если файла нет - fallback на `ops.view3d.ruler`. Артворк генерируется `tools/build_tool_icons.py`.
 - `infrastructure/blender_scene_measurements.py`
   - `SceneMeasurementSource`
@@ -85,7 +89,16 @@ Scene storage:
 - `bpy.types.Scene.scientia_measure_label_background`
 - `bpy.types.Scene.scientia_measure_reuse_last_code`
 - `bpy.types.Scene.scientia_measure_snap_by_default`
-- `bpy.types.Scene.scientia_measure_show_all_handles`
+- `bpy.types.Scene.scientia_measure_line_width`
+- `bpy.types.Scene.scientia_measure_show_points`
+- `bpy.types.Scene.scientia_measure_point_size`
+- `bpy.types.Scene.scientia_measure_fill_planes`
+- `bpy.types.Scene.scientia_measure_fill_alpha`
+- `bpy.types.Scene.scientia_measure_label_size`
+- `bpy.types.Scene.scientia_measure_label_at_center`
+- `bpy.types.Scene.scientia_measure_max_handle_points`
+- `bpy.types.Scene.scientia_measure_max_labels`
+- `bpy.types.Scene.scientia_measure_show_linear` / `_show_planes` / `_show_traces`
 - `bpy.types.Scene.scientia_measure_no_code_visible`
 - `bpy.types.Scene.scientia_measure_default_color`
 - `bpy.types.Scene.scientia_measure_active_color`
@@ -94,6 +107,16 @@ Scene storage:
 - `bpy.types.Scene.scientia_label_show_description`
 - `bpy.types.Scene.scientia_label_linear_*`
 - `bpy.types.Scene.scientia_label_plane_*`
+- `bpy.types.Scene.scientia_label_trace_*`
+
+### Trace measurements (тип TRACE)
+
+- Открытая полилиния по трещине; длина = сумма сегментов, поэтому она отличается от LINEAR между теми же концами. `domain/geometry.process_trace_measurement()` кладёт в `MeasurementRecord`: `length` (сумма), `segment_count`, `segment_lengths`, `mean_segment_length`, `span_length` (прямое расстояние между концами). Синуозность = `length / span_length` считается на месте использования, чтобы не хранить производное значение.
+- `line_orientation` - тренд прямой между концами, а не какого-то одного сегмента: зигзаг на север всё равно тренд на север.
+- Ни `area`, ни `plane_orientation`: трейс это линия на поверхности, а не поверхность. В оверлее `_measurement_is_polygon()` возвращает False, дуга угла и заливка не рисуются.
+- `ScientiaTraceMeasureOperator` наследует `ScientiaPolygonMeasureOperator`; различия вынесены в атрибуты класса `measurement_kind`, `closes`, `minimum_points`, `too_few_points_message`. Флаг `_polygon_preview["closed"]` гасит замыкание и заливку в превью.
+- Видимость: `scientia_measure_show_traces`. `_measurement_kind_visible()` смотрит **kind**, а не число точек - у трейса их столько же, сколько у полигона.
+- Экспорт `ProcessedTraceCsvWriter`, гистограмма `Visualizer.plot_traces_histogram()` отдельно от рёбер: сумма сегментов и прямое расстояние - два разных распределения.
 
 Measurement metadata:
 
@@ -143,13 +166,37 @@ Current behavior:
 
 Overlay:
 
+### Производительность оверлея
+
+Замеры (GPU и blf застабаны, best of 5, `scratchpad/bench.py`): 500 измерений 163 -> 18 мс, 2000 644 -> 23 мс, 10000 не укладывалось в 2-минутный таймаут -> 31 мс. Draw call'ов за перерисовку при 2000: 21823 -> 9.
+
+- **POST_VIEW геометрия в мировых координатах и от вида не зависит.** `_world_space_geometry()` собирает её один раз в `_geometry_cache`, ключ `_geometry_cache_key()`: `measurement_revision()` + длина коллекции + активный индекс + отпечаток точек активного измерения + hover + fill alpha + флаги видимости + стили кодов + цвета. Ревизию бампают мутирующие хелперы в `scene_measurements.py` (`add_scene_measurement`, `set_scene_measurement_points`, `delete_active_scene_measurement`), `undo_post`/`redo_post` хендлеры в `__init__.py`, а `load_post` чистит кэш целиком через `reset_tool_state()`.
+- **POST_PIXEL пересобирается каждый кадр** - он в экранных координатах. Поэтому там отсечение (`_visible_measurements()`), приоритет по расстоянию до центра вида и бюджеты.
+- `HandleBatches` копит **только центры** по ключу `(цвет, радиус)`; halo, заливка и кольцо - та же окружность в трёх радиусах. Итого ~6 батчей вместо 3-4 на каждую точку.
+- numpy обязателен для быстрого пути (Blender его везёт): `_offset_vertices()` для геометрии хэндлов, `_screen_positions()`/`_project_points()` для проекции. Python-фолбэк остаётся - он же то, что гоняют тесты; `disable_numpy_geometry()` вызывается автоматически, если GPU не принял массив.
+- **Проецировать надо пачкой.** Один трансформ на измерение дороже, чем скалярный путь: накладные расходы numpy на вызов больше, чем экономия на трёх точках. Все выбранные точки собираются в плоский список и проецируются одним вызовом.
+- **`measurements[index]` на Blender-коллекции линеен.** Индексация в цикле давала O(n²) - секунда на кадр при 10000. `_pick_measurements()` проходит коллекцию один раз и выбирает нужное по словарю рангов.
+- `_measurement_points()` читает координаты через `foreach_get` одним C-вызовом.
+- `_corner_offsets()` кэширует дуги углов плашки, уже умноженные на радиус; радиус в пределах перерисовки один.
+
 - `ensure_measure_overlay()` registers permanent View3D draw handlers while the addon is enabled.
 - `remove_measure_overlay()` removes them on `unregister()`.
 - Measurements remain visible after the drag operator finishes or after pressing `Esc`.
 - Lines and angle arcs are drawn in `POST_VIEW`.
 - Draggable point handles are drawn in `POST_PIXEL`, not as 3D GPU points, so endpoints and center points stay readable on top of object surfaces.
-- Endpoint handles are square; the center point of a 3-point angle is circular with a small cross. Active/preview/hovered handles are larger and brighter.
-- For performance, point handles are drawn for active/hovered measurements by default. `scientia_measure_show_all_handles=True` restores all point handles, but this is expensive on large datasets.
+- Все хэндлы - круглые залитые точки (`_draw_handle_dot_2d`): тёмный диск под низом держит читаемость на светлой геометрии, тонкое светлое кольцо - на тёмной. Центральная точка трёхточечной плоскости помечена крестом, цвет креста выбирается по яркости заливки (`_contrasting_mark_color`), иначе он теряется то на жёлтом активном, то на белом hovered. Active/preview/hovered точки крупнее и ярче.
+- `size` в хэндлах - **диаметр**, как и обещает настройка Point Size; `_draw_circle_outline_2d`/`_draw_filled_circle_2d` принимают радиус, поэтому `_draw_handle_dot_2d` делит на два. Прежний `_draw_handle_circle_2d` передавал `size` как радиус и рисовал центральную точку вдвое крупнее задуманного.
+- `scientia_measure_show_points` (панель: `All Points`, дефолт вкл) решает, каким измерениям рисовать точки: включено - всем видимым, выключено - только активному и hovered. Полностью спрятать точки нельзя намеренно: точку, которой не видно, нельзя схватить. Прежний отдельный `scientia_measure_show_all_handles` убран - он дублировал это решение вторым тумблером в другом месте панели, из-за чего `All Points` выглядел сломанным.
+- Overlay style lives under `Measurement Display > Line & Point Style` in the panel; accessors в `scene_measurements.py` (`scene_measure_line_width()`, `scene_measure_point_size()`, `scene_measure_points_visible()`, `scene_measure_fill_alpha()`) читают значения защитно и клампят их, потому что draw handler переживает reload аддона на пару перерисовок.
+  - `scientia_measure_line_width` задаёт `gpu.state.line_width_set()` в `POST_VIEW`; обводки хэндлов в `POST_PIXEL` масштабируются множителем `_outline_width_scale()` = width / `DEFAULT_LINE_WIDTH`, иначе вложенные контуры хэндла теряют пропорции.
+  - `scientia_measure_show_points` гасит хэндлы **сохранённых** измерений; preview активного измерения и полигона рисуется всегда, иначе ставить точки не по чему.
+  - Размеры хэндлов производные от `scientia_measure_point_size`: неактивное 0.8x, активное 1.0x, под курсором 1.25x. При дефолте 8.0 это ровно прежние 6.4/8.0/10.0.
+  - Заливка площадных измерений: `_area_fill_coords()` через `mathutils.geometry.tessellate_polygon` (держит вогнутые контуры трассированной трещины), fallback на веер, если `mathutils.geometry` недоступен. Рисуется до линий, цвет измерения с альфой `scientia_measure_fill_alpha`. Линейные измерения (2 точки) не заливаются никогда.
+  - `scientia_measure_label_size` идёт в `blf.size()`; всё остальное в подписи производное от него через `LABEL_*_RATIO` (межстрочный интервал, паддинги плашки, радиус скругления), поэтому подпись сохраняет пропорции на любом размере. Дефолт 12.0 воспроизводит прежние фиксированные 14 px строки и 4 px паддинга.
+  - `_label_block()` центрирует блок подписи на точке привязки, каждая строка центрируется внутри блока. Раньше якорь был левым верхним углом блока.
+  - Точка привязки (`_measurement_label()` → `_plane_label_anchor()`): для линейного - середина отрезка; для площадных при `scientia_measure_label_at_center` (дефолт вкл) - `_area_center()`, иначе прежнее поведение (средняя точка трёхточечной плоскости / среднее вершин полигона).
+  - `_area_center()` взвешивает центроиды по площади треугольников из `_area_fill_coords()`, поэтому подпись совпадает с центром того, что реально залито, и не уползает туда, где вершин гуще. Вырожденный контур (все точки на прямой или в одной точке) даёт нулевую площадь - fallback на `_average_point()`. Ни центроид площади, ни среднее вершин не гарантируют попадания внутрь вогнутого контура; такой точки вообще нет.
+  - Плашка подписи: `_rounded_rect_coords()` = три прямоугольника плюс четыре угловых веера. Радиус кламится половиной меньшей стороны, при радиусе 0 вырождается в два треугольника.
 - Snapped preview uses green color.
 - Snap target marker shape indicates best-effort snap type:
   - `FACE`: circle;

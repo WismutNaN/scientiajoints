@@ -109,6 +109,8 @@ def _measurement_kind_hint(measurement, point_count):
     kind = str(getattr(measurement, "kind", "") or "").upper()
     if kind == "LINEAR" and point_count == 2:
         return MeasurementKind.LINEAR
+    if kind == "TRACE" and point_count >= 2:
+        return MeasurementKind.TRACE
     if kind in {"PLANE", "POLYLINE"} and point_count >= 3:
         return MeasurementKind.PLANE
     return None

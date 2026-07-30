@@ -5,13 +5,16 @@ ScientiaJoints is a Blender add-on for collecting fracture/joint measurements, e
 The add-on supports two measurement sources:
 
 - Blender's standard Measure/Ruler annotations from `RulerData3D`.
-- The built-in Scientia Measure toolbar tool, which stores measurements in the `.blend` scene.
+- The built-in Scientia Measure, Scientia Polygon Plane and Scientia Trace toolbar tools,
+  which store measurements in the `.blend` scene.
 
 ## Features
 
 - Two-point linear measurements with distance, azimuth, dip, `dx`, `dy`, and `dz`.
 - Three-point plane measurements with dip, corrected azimuth, area, and angle.
 - Multi-point polygon plane measurements with best-fit dip/azimuth and boundary area.
+- Open trace measurements along a fracture, scored by the summed length of their segments,
+  with their own histogram and CSV export.
 - Fracture codes with per-code color and visibility.
 - `No code` group for uncoded measurements.
 - CSV/TXT export with measurement metadata.
@@ -175,11 +178,39 @@ script after changing the drawing code. `tests/test_tool_icons.py` fails if the
 committed files no longer match it, if the format is corrupt, or if a tool
 quietly fell back to the built-in ruler icon.
 
+To reuse the artwork outside Blender - in a slide, a document, a README - export
+it as PNG with a transparent background:
+
+```powershell
+python tools\build_tool_icons.py --png --png-size 1024
+```
+
+The files land in `icons/png/` and are not committed: they are regenerated from
+the same source in one command, and a committed copy would only go stale.
+
+### Reading rock structure in the viewport
+
+`Chart Appearance > Blender View > Rock Inspection` switches every 3D view to
+Rendered shading and lights the model for reading structure: a sun grazing the
+surface at a low angle so fractures and steps fall into shadow, near-parallel
+rays so a hairline fracture still casts one, no specular contribution so no
+highlight sits over the texture, matte materials, and low ambient light so the
+contrast survives. Press it again to restore the shading, world, material,
+camera and render settings and to delete the light it added.
+
 ## Basic Workflow
 
 1. Create measurements with Blender Measure/Ruler, `Scientia Measure`, or `Scientia Polygon Plane`.
 2. Use `Measurement Info` to inspect the selected measurement and assign an existing or new code.
 3. Use `Measurement Display` to set label fields, snap mode, code group colors, and visibility.
+   `Overlay Style` inside it controls the line width, the label text size and
+   whether a label sits at the centre of its measurement's area, whether point
+   handles are drawn and how large they are, and the translucent fill on plane
+   and polygon measurements together with its opacity. `Viewport Budget` at the
+   bottom caps how many point handles and labels a redraw draws: on a scene with
+   thousands of measurements those are what cost frame time, and the ones kept
+   are the ones nearest the middle of the view. Raise them to see more at once,
+   lower them if the viewport lags.
 4. Use `Histogram` or `Stereonet` buttons at the top of the sidebar panel.
 5. Use `Export` to write raw TXT or processed CSV files next to the saved `.blend` file.
 

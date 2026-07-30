@@ -126,12 +126,19 @@ class PurgeRegisteredToolsTests(unittest.TestCase):
 
         self.assertEqual(self.module.purge_registered_tools(), ("scientiajoints.measure",))
 
-    def test_both_add_on_tools_are_covered(self):
+    def test_every_add_on_tool_is_covered(self):
+        """A tool missing from TOOL_IDNAMES is one the purge cannot clean up,
+        which is what makes the next registration fail."""
+        self.assertEqual(
+            set(self.module.TOOL_IDNAMES),
+            {tool.bl_idname for tool in self.module._WORKSPACE_TOOLS},
+        )
         self.assertEqual(
             set(self.module.TOOL_IDNAMES),
             {
                 self.module.ScientiaMeasureWorkSpaceTool.bl_idname,
                 self.module.ScientiaPolygonMeasureWorkSpaceTool.bl_idname,
+                self.module.ScientiaTraceMeasureWorkSpaceTool.bl_idname,
             },
         )
 

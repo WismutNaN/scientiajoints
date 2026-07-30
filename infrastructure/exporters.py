@@ -128,6 +128,57 @@ class ProcessedEdgeCsvWriter:
                 ])
 
 
+class ProcessedTraceCsvWriter:
+    """One row per trace, describing how its total length is made up.
+
+    ``length`` is the sum of the segments and ``span_length`` the straight
+    distance between the ends; their ratio, ``sinuosity``, is how far the trace
+    wanders from that straight line.
+    """
+
+    def write(self, filename, records):
+        with open(filename, "w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file, delimiter=",")
+            writer.writerow([
+                "x",
+                "y",
+                "z",
+                "length",
+                "segment_count",
+                "mean_segment_length",
+                "min_segment_length",
+                "max_segment_length",
+                "span_length",
+                "sinuosity",
+                "azimuth",
+                "plunge",
+                "rotated_azimuth",
+                "point_count",
+                *METADATA_COLUMNS,
+            ])
+            for record in records:
+                line = record.line_orientation
+                segments = tuple(record.segment_lengths or ())
+                span = record.span_length or 0.0
+                writer.writerow([
+                    record.center.x,
+                    record.center.y,
+                    record.center.z,
+                    record.length,
+                    record.segment_count,
+                    record.mean_segment_length,
+                    min(segments) if segments else None,
+                    max(segments) if segments else None,
+                    record.span_length,
+                    (record.length / span) if span else None,
+                    line.azimuth if line is not None else None,
+                    line.dip if line is not None else None,
+                    line.rotated_azimuth if line is not None else None,
+                    len(record.points),
+                    *_record_metadata_values(record),
+                ])
+
+
 class ProcessedFaceCsvWriter:
     def write(self, filename, records):
         with open(filename, "w", newline="", encoding="utf-8") as file:

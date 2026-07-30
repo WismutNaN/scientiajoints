@@ -67,6 +67,7 @@ ICON_DIRECTORY_NAME = "icons"
 REQUIRED_ICONS = (
     "scientiajoints.measure.dat",
     "scientiajoints.polygon_measure.dat",
+    "scientiajoints.trace_measure.dat",
 )
 REQUIRED_MODULE_SYMBOLS = {
     "operators.py": (
@@ -87,6 +88,7 @@ REQUIRED_MODULE_SYMBOLS = {
     "custom_measure_tool.py": (
         "ScientiaMeasureDragOperator",
         "ScientiaPolygonMeasureOperator",
+        "ScientiaTraceMeasureOperator",
         "register_measure_tool",
         "reset_tool_state",
     ),

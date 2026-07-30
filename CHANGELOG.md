@@ -2,6 +2,69 @@
 
 All notable changes to ScientiaJoints are documented here.
 
+## [Unreleased]
+
+### Added
+
+- Added a trace measurement type and the `Scientia Trace` tool that creates it. A trace is an open polyline along a fracture: its length is the sum of its segments, which is what separates it from a linear measurement between the same two end points. The tool works like the polygon tool with the closing taken out - click along the trace, right click, Enter or Space to finish, Backspace to undo a point - and two points already make one. It has its own toolbar icon and never gets the area fill or the angle arc, because it encloses nothing.
+  - Traces have their own visibility toggle next to `Linear` and `Planes`, in the sidebar and in the tool header. Hiding planes no longer hides traces, which matters because a trace has as many points as a polygon and the kind, not the point count, has to decide.
+  - `Measurement Info` reports the total length, the segment count, the mean, smallest and largest segment, the straight span between the ends and the sinuosity. The same fields are available as viewport label fields.
+  - Added `Export > Processed > Traces`, a CSV with one row per trace carrying the total length, segment count, mean, smallest and largest segment, the span and the sinuosity, alongside the trace's overall azimuth and plunge.
+  - Added a separate `Trace Histogram` with its own auto-update toggle, matching the ones the edge histogram and the stereonet have. A trace length is a sum of segments and an edge length a straight distance, so one distribution cannot hold both. `Statistics` reports trace lengths in their own block for the same reason. Only one real-time chart runs at a time; the mutual exclusion is one helper rather than a pair of cross-references, because with three toggles the old pattern would have needed six.
+
+### Changed
+
+- The `Light` button is now `Rock Inspection`, and it does what its name says. It switches every 3D view to Rendered shading and lights the model for reading structure rather than for looking pretty: a sun grazing the surface at 22 degrees, which throws every fracture, groove and step into shadow where a light near the camera flattens them; near-parallel rays so a hairline fracture still casts something to see; no specular contribution at all, because a highlight on wet or polished rock hides exactly the texture being read; matte materials; and ambient light dropped to 0.12, so the contrast the sun buys is not filled straight back in. Eevee shadows and short-range indirect light are switched on so a crevice darkens instead of filling uniformly, and a higher-contrast colour management look is used when the configuration offers one.
+- Pressing it again restores the viewport shading, world, material, camera, colour management look and render settings, and deletes the light it added along with its datablock, so repeated toggles accumulate nothing. The button reads `Restore View` and shows as depressed while the mode is on.
+
+- Reordered the sidebar by how often each part is used. The chart buttons and the measurement work stay at the top; `Chart Appearance` follows, then `Export`, `Statistics` and `Azimuth Correction`, which are opened once a session rather than continuously. Inside `Chart Appearance` the stereonet controls come first - hemisphere, density sigma, pole size - because those are adjusted while reading a plot, and the image size and update interval moved below them.
+- Replaced the icons on the measurement kind toggles. `Linear` used the edge-split modifier icon and `Planes` the face-snapping icon, neither of which depicts what it switched; they are now a dimension between two points and a flat quad, with a zigzag polyline for traces. The three come from one place in `scene_measurements.py`, so the tool header and the sidebar cannot drift apart.
+- Every collapsible sidebar section now carries an icon next to its disclosure triangle, so a collapsed panel is still scannable, and the export and statistics rows are labelled by kind rather than by file format alone.
+- The three tools no longer each draw their own copy of the tool header settings, which is how they came to offer different toggles.
+
+## [Unreleased]
+
+### Changed
+
+- The viewport overlay is roughly 9x faster at 500 measurements and 28x at 2000, and its cost no longer grows with the size of the scene. Measured with the GPU and font calls stubbed out, best of five redraws: 500 measurements went from 163 ms to 18 ms, 2000 from 644 ms to 23 ms, and 10000 - which the old overlay could not complete inside a two minute benchmark - now draws in 31 ms. The number of draw calls per redraw fell from 21823 to 9 at 2000 measurements.
+  - The 3D overlay is built once and reused. Its geometry is in world space, so orbiting, panning and zooming leave every vertex where it was; it used to be rebuilt every frame, tessellating each polygon and generating each angle arc again. It is now keyed on a revision the measurement helpers bump, plus the style values it depends on, and cleared on file load, undo and redo.
+  - Point handles are gathered by colour and size and drawn as a handful of merged batches. Each handle used to issue three or four `batch_for_shader` calls, each allocating and uploading its own vertex buffer, which is what made a dense scene stall.
+  - Handle geometry and the projection from world to screen are vectorised with numpy, which Blender bundles. The pure Python path remains as a fallback, and a GPU that refuses an array downgrades to it for the session with a warning rather than losing the overlay.
+  - Measurements are culled against the viewport and ordered by distance to the middle of the view, so off-screen ones cost nothing.
+  - Two budgets under `Overlay Style > Viewport Budget` cap the per-redraw cost of the screen-space work: `Handle Points` (2000) and `Labels` (200). What gets dropped is whatever is furthest from where you are looking; the active and hovered measurement are never dropped. Past those counts nothing on screen is legible anyway.
+  - Smaller wins along the way: the angle arc no longer builds a rotation matrix per segment, the code colour and visibility lookups no longer scan the code collection once per measurement, point coordinates are read with `foreach_get` in one C call, the label plate's corner arcs are computed once per redraw instead of once per label, and label text is read once for both the handle and the label pass.
+- `ANGLE_ARC_SEGMENTS` dropped from 32 to 16 and the handle circles from 20 and 28 segments to 12. At the size these are drawn the difference is not visible; the arc rewrite agrees with the rotation-matrix version it replaced to within 2.3e-07.
+
+### Removed
+
+- Removed the `All Handles` scene property. `All Points` and the handle budget decide this now.
+
+## [Unreleased]
+
+### Added
+
+- Added viewport overlay style settings, grouped under `Overlay Style` in `Measurement Display`, directly after `Label Fields`:
+  - `Line Width` sets the thickness of measurement lines. The outlines around the point handles scale with it, so the whole overlay thickens together instead of the lines pulling away from the handles.
+  - `Label at Area Center` puts the label of a plane or polygon measurement in the middle of its surface instead of on the corner point the measurement hinges on, where the text landed beside the shape it describes rather than on it. The centre is area-weighted over the same triangles the fill is drawn from, so it agrees with what is shaded and does not drift towards whichever side of a traced outline carries the most points. Switch it off to get the corner back; that corner is also where the angle a plane label can report is measured.
+  - `Label Size` sets the text size of the measurement labels. The line spacing, the padding around the text and the corner rounding are all relative to it, so a label keeps its proportions at any size.
+  - `All Points` draws a handle on every point of every measurement. Switched off, only the active and hovered measurement keep theirs, which is quicker to draw and less cluttered on a dense scene; a measurement stays editable either way, because a point you cannot see is a point you cannot grab.
+  - `Size` sets the handle diameter. The active and hovered handles stay proportionally larger, and the default reproduces the sizes the overlay used before the setting existed.
+  - `Fill` shades plane and polygon measurements with a translucent surface in the measurement's own colour, so an area reads as a surface rather than an outline, with `Opacity` controlling how much shows through. Concave polygons are tessellated rather than fanned, so the fill of a traced fracture boundary stays inside it. Linear measurements enclose nothing and are never filled.
+
+- Added `--png` to `tools/build_tool_icons.py`, writing each toolbar icon as a standalone PNG with a transparent background, for slides and documents. The `.dat` files the add-on ships are triangle lists no other program reads. The export is supersampled, and the edge pixels take their colour only from the covered samples, so the artwork does not get the dark fringe that averaging in the transparent ones produces on a light slide.
+
+### Changed
+
+- Point handles are now round dots instead of squares. The middle point of a three-point plane keeps a mark that tells it from an endpoint, and the mark takes black or white by the contrast against the handle underneath, which the previous fixed white cross lost against a light one.
+- `Point Size` is now honoured as a diameter everywhere. The middle point of a three-point plane was drawn from the same number as a radius, which made it twice the size it asked for.
+- Removed the separate `All Handles` toggle. It decided the same thing as `All Points` from another part of the panel, so turning point handles on appeared to do nothing until the second toggle was found as well.
+- Measurement labels are now centred on the measurement they name. They used to hang off it by one corner, which put a label for a point at the top left of that point and made a dense scene hard to read. Each line is centred within the label as well.
+- The label background is now a rounded plate instead of a square one.
+
+### Fixed
+
+- Fixed the diagnostics report calling a current `mplstereonet` outdated. The package version was read from the module's `__version__`, which 0.6.3 still leaves at `0.6-dev`; the distribution metadata, which records what was actually installed, is now asked first.
+
 ## [3.3.2]
 
 ### Fixed

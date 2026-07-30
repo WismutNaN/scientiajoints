@@ -120,6 +120,46 @@ def process_linear_measurement(raw: RawMeasurement, correction: AzimuthCorrectio
     )
 
 
+def process_trace_measurement(raw: RawMeasurement, correction: AzimuthCorrection) -> MeasurementRecord:
+    """An open polyline following a fracture trace.
+
+    Its length is the sum of its segments, not the distance between its ends;
+    the two differ by however much the trace wanders, which is the point of
+    measuring a trace rather than a straight line across it. The orientation
+    recorded is that of the straight line between the end points, because that
+    is the trace's overall trend.
+    """
+    points = raw.points
+    segment_lengths = tuple(
+        Vector3.between(points[index], points[index + 1]).length()
+        for index in range(len(points) - 1)
+    )
+    total_length = sum(segment_lengths)
+    span = Vector3.between(points[0], points[-1]) if len(points) >= 2 else Vector3(0.0, 0.0, 0.0)
+    span_azimuth = span.azimuth()
+
+    return MeasurementRecord(
+        id=raw.source_id or _measurement_id(raw),
+        kind=MeasurementKind.TRACE,
+        points=points,
+        center=center_of(points),
+        source=raw.source,
+        source_id=raw.source_id,
+        layer=raw.layer,
+        properties=raw.properties,
+        line_orientation=Orientation(
+            azimuth=span_azimuth,
+            dip=span.plunge(),
+            rotated_azimuth=correction.apply(span_azimuth),
+        ),
+        length=total_length,
+        segment_count=len(segment_lengths),
+        segment_lengths=segment_lengths,
+        mean_segment_length=(total_length / len(segment_lengths)) if segment_lengths else None,
+        span_length=span.length(),
+    )
+
+
 def process_plane_measurement(raw: RawMeasurement, correction: AzimuthCorrection) -> MeasurementRecord:
     points = raw.points
     p1, p2, p3 = points[:3]

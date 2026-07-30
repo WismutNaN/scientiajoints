@@ -11,5 +11,11 @@ dist/
 # Release wheels are large binaries fetched by tools/fetch_wheels.py.
 wheels/
 
+# Presentation exports of the toolbar icons. The .dat files next to them are
+# what the add-on ships; these are regenerated on demand and would only go
+# stale in the repository.
+# Rebuild: python tools/build_tool_icons.py --png
+icons/png/
+
 *.blend1
 *.blend2

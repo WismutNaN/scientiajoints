@@ -2,7 +2,11 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
-from ..domain.geometry import process_linear_measurement, process_plane_measurement
+from ..domain.geometry import (
+    process_linear_measurement,
+    process_plane_measurement,
+    process_trace_measurement,
+)
 from ..domain.measurements import (
     AzimuthCorrection,
     MeasurementKind,
@@ -47,12 +51,14 @@ class SourceReadResult:
 
 class MeasurementApplicationService:
     def __init__(self, source, raw_edge_writer=None, raw_face_writer=None,
-                 processed_edge_writer=None, processed_face_writer=None):
+                 processed_edge_writer=None, processed_face_writer=None,
+                 processed_trace_writer=None):
         self.source = source
         self.raw_edge_writer = raw_edge_writer
         self.raw_face_writer = raw_face_writer
         self.processed_edge_writer = processed_edge_writer
         self.processed_face_writer = processed_face_writer
+        self.processed_trace_writer = processed_trace_writer
 
     def ingest_measurements(self) -> MeasurementSet:
         source_result = self.source.read_strokes()
@@ -77,6 +83,8 @@ class MeasurementApplicationService:
             point_count = len(stroke.points)
             if stroke.kind_hint == MeasurementKind.LINEAR and point_count == 2:
                 kind = MeasurementKind.LINEAR
+            elif stroke.kind_hint == MeasurementKind.TRACE and point_count >= 2:
+                kind = MeasurementKind.TRACE
             elif stroke.kind_hint == MeasurementKind.PLANE and point_count >= 3:
                 kind = MeasurementKind.PLANE
             elif stroke.kind_hint is None and point_count == 2:
@@ -148,6 +156,10 @@ class MeasurementApplicationService:
         correction = AzimuthCorrection(az_real=az_real, az_model=az_model)
         return tuple(process_plane_measurement(raw, correction) for raw in measurements.faces)
 
+    def process_traces(self, measurements: MeasurementSet, az_real=0, az_model=0):
+        correction = AzimuthCorrection(az_real=az_real, az_model=az_model)
+        return tuple(process_trace_measurement(raw, correction) for raw in measurements.traces)
+
     def export_raw_edges(self, measurements: MeasurementSet, filename: str) -> ExportResult:
         return self._write(self.raw_edge_writer, measurements.edges, filename, "Raw edges")
 
@@ -159,6 +171,9 @@ class MeasurementApplicationService:
 
     def export_processed_faces(self, records, filename: str) -> ExportResult:
         return self._write(self.processed_face_writer, records, filename, "Processed faces")
+
+    def export_processed_traces(self, records, filename: str) -> ExportResult:
+        return self._write(self.processed_trace_writer, records, filename, "Processed traces")
 
     def _write(self, writer, rows, filename: str, label: str) -> ExportResult:
         if writer is None:

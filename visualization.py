@@ -40,9 +40,10 @@ def _numpy_legacy_aliases():
                 pass
 
 class Visualizer:
-    def __init__(self, edges_data, faces_data, figure_width=6.0, figure_height=6.0, marker_size=2.0, edge_width=0.4, marker_face_color=(1.0, 1.0, 1.0), marker_edge_color=(0.0, 0.0, 0.0), density_sigma=1.2, hemisphere='UPPER'):
+    def __init__(self, edges_data, faces_data, figure_width=6.0, figure_height=6.0, marker_size=2.0, edge_width=0.4, marker_face_color=(1.0, 1.0, 1.0), marker_edge_color=(0.0, 0.0, 0.0), density_sigma=1.2, hemisphere='UPPER', traces_data=()):
         self.edges_data = edges_data
         self.faces_data = faces_data
+        self.traces_data = tuple(traces_data)
         self.figure_width = figure_width
         self.figure_height = figure_height
         self.marker_size = marker_size
@@ -106,6 +107,72 @@ class Visualizer:
         except Exception as e:
             logger.error("Error generating edges histogram: %s", e, exc_info=True)
             return None, {}
+
+    def plot_traces_histogram(self):
+        """Distribution of trace lengths, kept apart from the edge histogram.
+
+        A trace length is a sum of segments along a fracture and an edge length
+        is a straight distance between two points; putting them in one histogram
+        would mix two different measurements into one distribution.
+        """
+        lengths = [trace.length for trace in self.traces_data]
+        if not lengths:
+            logger.warning("No trace data to plot.")
+            return None, {}
+
+        try:
+            import matplotlib
+            matplotlib.use('Agg', force=True)
+            import matplotlib.pyplot as plt
+            import tempfile
+
+            stats = self.get_traces_statistics()
+
+            plt.figure(figsize=(self.figure_width, self.figure_height))
+            plt.hist(lengths, bins=20, color='#5ac8fa', edgecolor='black')
+            plt.title('Histogram of Trace Lengths')
+            plt.xlabel('Trace length')
+            plt.ylabel('Frequency')
+
+            histogram_path = os.path.join(tempfile.gettempdir(), 'traces_histogram.png')
+            plt.savefig(histogram_path)
+            plt.close()
+            logger.info(f"Traces histogram saved to {histogram_path}")
+
+            return histogram_path, stats
+        except Exception as e:
+            logger.error("Error generating traces histogram: %s", e, exc_info=True)
+            return None, {}
+
+    def get_traces_statistics(self):
+        """Summary of the trace set, including how its segments are made up."""
+        import numpy as np
+
+        try:
+            lengths = [trace.length for trace in self.traces_data]
+            if not lengths:
+                return {}
+            segments = [
+                length
+                for trace in self.traces_data
+                for length in (getattr(trace, "segment_lengths", ()) or ())
+            ]
+            stats = {
+                'Traces': len(lengths),
+                'Total Length': float(np.sum(lengths)),
+                'Mean': float(np.mean(lengths)),
+                'Median': float(np.median(lengths)),
+                'Std Dev': float(np.std(lengths)),
+                'Min': float(np.min(lengths)),
+                'Max': float(np.max(lengths)),
+            }
+            if segments:
+                stats['Segments'] = len(segments)
+                stats['Mean Segment'] = float(np.mean(segments))
+            return stats
+        except Exception as e:
+            logger.error("Error calculating trace statistics: %s", e, exc_info=True)
+            return {}
 
     def plot_faces_stereonet(self):
         if not self.faces_data:
@@ -215,6 +282,37 @@ def update_histogram_image(context, report_errors=True):
         if report_errors:
             logger.warning("Histogram image not found.")
         return False
+
+def update_traces_histogram_image(context, report_errors=True):
+    parser = MeasurementsParser()
+    scene = context.scene
+    records = parser.get_processed_trace_records(az_real=scene.az_real, az_model=scene.az_model)
+
+    visualizer = Visualizer(
+        [], [],
+        figure_width=scene.figure_width,
+        figure_height=scene.figure_height,
+        traces_data=records,
+    )
+    histogram_path, _stats = visualizer.plot_traces_histogram()
+
+    if histogram_path and os.path.exists(histogram_path):
+        image_name = os.path.basename(histogram_path)
+        image = bpy.data.images.get(image_name)
+        if image:
+            image.filepath = histogram_path
+            image.reload()
+        else:
+            image = bpy.data.images.load(histogram_path)
+
+        open_image_in_image_editor(image)
+        logger.info("Traces histogram image updated.")
+        return True
+
+    if report_errors:
+        logger.warning("Traces histogram image not found.")
+    return False
+
 
 def update_stereonet_image(context, report_errors=True):
     import os

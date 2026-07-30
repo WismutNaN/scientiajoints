@@ -17,6 +17,7 @@ from .infrastructure.blender_scene_measurements import CompositeMeasurementSourc
 from .infrastructure.exporters import (
     ProcessedEdgeCsvWriter,
     ProcessedFaceCsvWriter,
+    ProcessedTraceCsvWriter,
     RawEdgeTxtWriter,
     RawFaceTxtWriter,
 )
@@ -109,6 +110,7 @@ def _create_default_service():
         raw_face_writer=RawFaceTxtWriter(),
         processed_edge_writer=ProcessedEdgeCsvWriter(),
         processed_face_writer=ProcessedFaceCsvWriter(),
+        processed_trace_writer=ProcessedTraceCsvWriter(),
     )
 
 
@@ -124,6 +126,7 @@ class MeasurementsParser:
         self.service = service or _create_default_service()
         self.faces = []
         self.edges = []
+        self.traces = []
         self.measurement_set = None
         self.total_strokes_count = 0
         self.duplicate_strokes_count = 0
@@ -136,6 +139,7 @@ class MeasurementsParser:
     def parse_dimensions(self):
         self.faces = []
         self.edges = []
+        self.traces = []
         self.measurement_set = self.service.ingest_measurements()
 
         diagnostics = self.measurement_set.diagnostics
@@ -151,8 +155,13 @@ class MeasurementsParser:
                 self.faces.append(list(raw.points))
             elif raw.kind == MeasurementKind.LINEAR:
                 self.edges.append(list(raw.points))
+            elif raw.kind == MeasurementKind.TRACE:
+                self.traces.append(list(raw.points))
 
-        logger.info("Parsed %d faces and %d edges.", len(self.faces), len(self.edges))
+        logger.info(
+            "Parsed %d faces, %d edges and %d traces.",
+            len(self.faces), len(self.edges), len(self.traces),
+        )
 
     def export_raw_edges(self, filename=None):
         if not bpy.data.is_saved:
@@ -191,6 +200,20 @@ class MeasurementsParser:
         filename = filename or _default_export_path("_faces_processed.csv")
         records = self.get_processed_face_records(az_real=az_real, az_model=az_model)
         return self.service.export_processed_faces(records, filename)
+
+    def process_traces(self, az_real=0, az_model=0, filename=None):
+        if not bpy.data.is_saved:
+            self.show_save_prompt()
+            return ExportResult(False, None, "Save the Blender file before exporting processed traces.")
+
+        self._ensure_ready()
+        filename = filename or _default_export_path("_traces_processed.csv")
+        records = self.get_processed_trace_records(az_real=az_real, az_model=az_model)
+        return self.service.export_processed_traces(records, filename)
+
+    def get_processed_trace_records(self, az_real=0, az_model=0):
+        self._ensure_ready()
+        return self.service.process_traces(self.measurement_set, az_real=az_real, az_model=az_model)
 
     def get_processed_edge_records(self, az_real=0, az_model=0):
         self._ensure_ready()

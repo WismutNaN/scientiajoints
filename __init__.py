@@ -4,7 +4,7 @@
 bl_info = {
     "name": "ScientiaJoints",
     "author": "Scientia, Ivan Guzeev",
-    "version": (3, 3, 3),
+    "version": (3, 4, 2),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > ScientiaJoints",
     "description": "Export measurements with visualizations and adjustable settings",
@@ -71,6 +71,7 @@ _CORE_SCENE_PROPERTY_NAMES = (
     "stereonet_hemisphere",
     "real_time_update_histogram",
     "real_time_update_stereonet",
+    "real_time_update_traces",
     "update_interval",
     *scene_measurement_scene_properties(),
 )
@@ -83,6 +84,7 @@ _PANEL_SCENE_PROPERTY_NAMES = (
     "show_measurement_info",
     "show_measurement_display_settings",
     "show_label_field_settings",
+    "show_overlay_style_settings",
 )
 
 
@@ -271,17 +273,45 @@ def _start_realtime_operator(operator_name, log_label):
         logger.error("Could not schedule the real-time %s update: %s", log_label, e, exc_info=True)
 
 
+#: The real-time chart toggles. Only one runs at a time: each drives a modal
+#: operator on a timer that reloads an image into the image editor, and two of
+#: them doing that at once fight over the editor and pay the cost twice.
+_REALTIME_TOGGLE_PROPERTIES = (
+    "real_time_update_histogram",
+    "real_time_update_stereonet",
+    "real_time_update_traces",
+)
+
+
+def _stop_other_realtime_updates(scene, keep):
+    """Switch off every real-time toggle except ``keep``.
+
+    Setting one to False re-enters its own update callback, which returns
+    immediately because the value is off, so this cannot recurse.
+    """
+    for name in _REALTIME_TOGGLE_PROPERTIES:
+        if name != keep and getattr(scene, name, False):
+            setattr(scene, name, False)
+
+
 def update_real_time_update_histogram(self, context):
     if context.scene.real_time_update_histogram:
-        context.scene.real_time_update_stereonet = False
+        _stop_other_realtime_updates(context.scene, "real_time_update_histogram")
         _start_realtime_operator("real_time_histogram_update_operator", "histogram")
     # Switching the toggle off lets the running modal operator stop itself.
 
 
 def update_real_time_update_stereonet(self, context):
     if context.scene.real_time_update_stereonet:
-        context.scene.real_time_update_histogram = False
+        _stop_other_realtime_updates(context.scene, "real_time_update_stereonet")
         _start_realtime_operator("real_time_stereonet_update_operator", "stereonet")
+    # Switching the toggle off lets the running modal operator stop itself.
+
+
+def update_real_time_update_traces(self, context):
+    if context.scene.real_time_update_traces:
+        _stop_other_realtime_updates(context.scene, "real_time_update_traces")
+        _start_realtime_operator("real_time_traces_update_operator", "trace histogram")
     # Switching the toggle off lets the running modal operator stop itself.
 
 
@@ -308,18 +338,47 @@ def _on_file_load(*_args):
         logger.debug("Could not reset the statistics cache: %s", e)
 
 
+@bpy.app.handlers.persistent
+def _on_undo(*_args):
+    """Throw away the cached viewport geometry after an undo or a redo.
+
+    Undo restores the measurement collection behind the add-on's back: nothing
+    calls the helpers that bump the revision the overlay cache is keyed on, so
+    without this the viewport would keep drawing the state that was undone.
+    """
+    try:
+        from .scene_measurements import bump_measurement_revision
+
+        bump_measurement_revision()
+    except Exception as e:
+        logger.debug("Could not invalidate the measurement overlay cache: %s", e)
+
+
+_HANDLER_LISTS = (
+    ("load_post", "_on_file_load"),
+    ("undo_post", "_on_undo"),
+    ("redo_post", "_on_undo"),
+)
+
+
 def _register_handlers():
     _unregister_handlers()
     bpy.app.handlers.load_post.append(_on_file_load)
+    bpy.app.handlers.undo_post.append(_on_undo)
+    bpy.app.handlers.redo_post.append(_on_undo)
 
 
 def _unregister_handlers():
-    for handler in list(bpy.app.handlers.load_post):
-        if getattr(handler, "__name__", "") == "_on_file_load":
-            try:
-                bpy.app.handlers.load_post.remove(handler)
-            except Exception:
-                pass
+    for list_name, handler_name in _HANDLER_LISTS:
+        handlers = getattr(bpy.app.handlers, list_name, None)
+        if handlers is None:
+            continue
+        for handler in list(handlers):
+            if getattr(handler, "__name__", "") == handler_name:
+                try:
+                    handlers.remove(handler)
+                except Exception:
+                    pass
 
 # Define PropertyGroups
 class LightSettings(bpy.types.PropertyGroup):
@@ -336,6 +395,14 @@ class LightSettings(bpy.types.PropertyGroup):
     focal_length: FloatProperty()
     clip_start: FloatProperty()
     clip_end: FloatProperty()
+    #: Viewport shading to go back to. One value for every 3D view: the
+    #: inspection mode puts them all in Rendered, so it restores them all the
+    #: same way rather than pretending to remember each one.
+    viewport_shading: StringProperty()
+    #: Colour management look to go back to, and the raking light object to
+    #: delete. Empty when there was nothing to change or nothing was created.
+    view_look: StringProperty()
+    created_light: StringProperty()
 
 def register():
     global classes, _startup_diagnostics_generation
@@ -357,10 +424,13 @@ def register():
             ExportRawFacesOperator,
             ExportProcessedEdgesOperator,
             ExportProcessedFacesOperator,
+            ExportProcessedTracesOperator,
             ShowHistogramImageOperator,
+            ShowTracesHistogramImageOperator,
             ShowStereonetImageOperator,
             RealTimeHistogramUpdateOperator,
             RealTimeStereonetUpdateOperator,
+            RealTimeTracesUpdateOperator,
             ScientiaDiagnosticsCopyOperator,
             ScientiaDiagnosticsOperator,
             ScientiaDiagnosticsSaveOperator,
@@ -373,6 +443,7 @@ def register():
             ScientiaDeselectMeasurementOperator,
             ScientiaMeasureDragOperator,
             ScientiaPolygonMeasureOperator,
+            ScientiaTraceMeasureOperator,
             register_measure_tool,
         )
         from .panel import (
@@ -487,6 +558,13 @@ def register():
             update=update_real_time_update_stereonet
         )
 
+        bpy.types.Scene.real_time_update_traces = BoolProperty(
+            name="Real-Time Update",
+            description="Toggle real-time updating of the trace length histogram",
+            default=False,
+            update=update_real_time_update_traces
+        )
+
         bpy.types.Scene.update_interval = FloatProperty(
             name="Chart update interval",
             description="Set the interval (in seconds) for real-time updates. The interval can be changed in the visualization settings, but only when the automatic update function is disabled.",
@@ -501,16 +579,20 @@ def register():
         class_candidates = (
             ScientiaMeasureDragOperator,
             ScientiaPolygonMeasureOperator,
+            ScientiaTraceMeasureOperator,
             ScientiaDeleteActiveMeasurementOperator,
             ScientiaDeselectMeasurementOperator,
             ExportRawEdgesOperator,
             ExportRawFacesOperator,
             ExportProcessedEdgesOperator,
             ExportProcessedFacesOperator,
+            ExportProcessedTracesOperator,
             ShowHistogramImageOperator,
+            ShowTracesHistogramImageOperator,
             ShowStereonetImageOperator,
             RealTimeHistogramUpdateOperator,
             RealTimeStereonetUpdateOperator,
+            RealTimeTracesUpdateOperator,
             ToggleLightSettingsOperator,
             ScientiaInstallDependenciesOperator,
             ScientiaDiagnosticsOperator,

@@ -188,6 +188,29 @@ class MinimumVersionTests(unittest.TestCase):
                 ):
                     self.assertEqual(self.dependencies.outdated_packages(), ())
 
+    def test_the_version_comes_from_the_metadata_not_the_module(self):
+        """mplstereonet 0.6.3 still calls itself '0.6-dev' in code, so trusting
+        __version__ reports a current install as outdated."""
+        module = types.SimpleNamespace(__version__="0.6-dev", __file__="mplstereonet/__init__.py")
+        with unittest.mock.patch.dict(sys.modules, {"mplstereonet": module}):
+            with unittest.mock.patch("importlib.metadata.version", lambda name: "0.6.3"):
+                version, location = self.dependencies._package_details("mplstereonet")
+
+        self.assertEqual(version, "0.6.3")
+        self.assertEqual(location, "mplstereonet/__init__.py")
+
+    def test_the_module_version_is_the_fallback_when_there_is_no_metadata(self):
+        module = types.SimpleNamespace(__version__="1.2.3", __file__="somewhere.py")
+
+        def no_metadata(name):
+            raise LookupError(name)
+
+        with unittest.mock.patch.dict(sys.modules, {"mplstereonet": module}):
+            with unittest.mock.patch("importlib.metadata.version", no_metadata):
+                version, _location = self.dependencies._package_details("mplstereonet")
+
+        self.assertEqual(version, "1.2.3")
+
     def test_the_install_command_asks_pip_for_the_minimum_version(self):
         """Without this a fresh online install can still pick up 0.6.2."""
         command = self.dependencies._install_command(

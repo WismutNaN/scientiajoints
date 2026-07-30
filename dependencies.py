@@ -168,16 +168,23 @@ def _package_import_error(package):
 
 
 def _package_details(package):
-    module = sys.modules.get(package)
-    version = str(getattr(module, "__version__", "") or "") if module is not None else ""
-    location = str(getattr(module, "__file__", "") or "") if module is not None else ""
-    if not version:
-        try:
-            from importlib import metadata
+    """Version and file of an installed package.
 
-            version = metadata.version(_pip_name(package))
-        except Exception:
-            version = ""
+    The distribution metadata is asked first, because it records what was
+    actually installed. A module's ``__version__`` is only as accurate as the
+    author's last release commit: mplstereonet 0.6.3 still calls itself
+    ``0.6-dev`` in code, which would report a current install as outdated.
+    """
+    module = sys.modules.get(package)
+    location = str(getattr(module, "__file__", "") or "") if module is not None else ""
+    try:
+        from importlib import metadata
+
+        version = str(metadata.version(_pip_name(package)) or "")
+    except Exception:
+        version = ""
+    if not version and module is not None:
+        version = str(getattr(module, "__version__", "") or "")
     return version, location
 
 
