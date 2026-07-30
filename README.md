@@ -5,268 +5,292 @@
 <h1 align="center">ScientiaJoints</h1>
 
 <p align="center">
-  A Blender add-on for mapping rock mass fracturing: measurements on a 3D model,<br>
-  statistics, stereonets and export.
+  A Blender add-on for measuring rock mass fracturing on a three-dimensional
+  model of an outcrop.
 </p>
 
 <p align="center"><a href="README.ru.md">Русская версия</a></p>
 
----
-
-ScientiaJoints is a Blender add-on for collecting fracture/joint measurements, exporting raw and processed data, and generating histograms and stereonets.
-
 ![Example](screen.png)
 
-The add-on supports two measurement sources:
+## Task
 
-- Blender's standard Measure/Ruler annotations from `RulerData3D`.
-- The built-in Scientia Measure, Scientia Polygon Plane and Scientia Trace toolbar tools,
-  which store measurements in the `.blend` scene.
+The input is a polygonal model of an outcrop produced by photogrammetry or laser
+scanning. The add-on takes fracture measurements from it, computes the
+orientation and the metric quantities of each measurement, builds distributions
+and exports the result to CSV.
 
-## Features
+The model has to be oriented. Any offset from true north is entered as an
+azimuth correction and applied to the results (workflow, step 4).
 
-- Two-point linear measurements with distance, azimuth, dip, `dx`, `dy`, and `dz`.
-- Three-point plane measurements with dip, corrected azimuth, area, and angle.
-- Multi-point polygon plane measurements with best-fit dip/azimuth and boundary area.
-- Open trace measurements along a fracture, scored by the summed length of their segments,
-  with their own histogram and CSV export.
-- Fracture codes with per-code color and visibility.
-- `No code` group for uncoded measurements.
-- CSV/TXT export with measurement metadata.
-- Histogram and stereonet rendering.
-- Chart dependencies bundled in the release archive, installable without internet access.
-- Built-in diagnostics report with a self-test and detected problems.
+The add-on supports the following measurements:
+
+- dip azimuth and dip angle of a fracture plane;
+- spacing between fractures of one set;
+- fracture length along the surface;
+- area of the outline in the plane of the measurement;
+- grouping of measurements into sets through codes and pole density on the
+  stereonet.
+
+## Measurement types and computed quantities
+
+| Type | Points | Computed |
+|---|---|---|
+| `LINEAR` | 2 | Distance between the points. Azimuth and plunge of the line, azimuth and dip of the plane perpendicular to it, corrected azimuth. Increments `dx`, `dy`, `dz` and the horizontal projection. |
+| `PLANE` | 3 | Dip azimuth, dip angle, corrected azimuth. Triangle area. Angle at the middle point. A degeneracy flag when the points are collinear or coincident. |
+| `POLYLINE` | 3 or more, outline closed | As `PLANE`, with the plane fitted to every point by least squares. Additionally the RMS distance of the points from the fitted plane, absolute and relative. |
+| `TRACE` | 2 or more, outline open | Sum of the segment lengths. Segment count, mean, smallest and largest segment length. Straight distance between the ends and the ratio of the sum to it. Azimuth and plunge of the line between the ends. |
+
+The azimuth correction applies to the azimuths of every type. The uncorrected
+azimuth is kept and exported in a separate column.
+
+## Tools
+
+The three tools sit in the 3D View toolbar after Blender's own ruler.
+
+| Icon | Tool | Action |
+|---|---|---|
+| ![](docs/icons/scientiajoints.measure.png) | Scientia Measure | Dragging empty space creates a `LINEAR` measurement. Dragging the middle of a segment adds a third point and turns the measurement into `PLANE`. Dragging a point moves it. |
+| ![](docs/icons/scientiajoints.polygon_measure.png) | Scientia Polygon Plane | Clicks place the points of a closed outline; the measurement is stored as `POLYLINE`. Three points minimum. |
+| ![](docs/icons/scientiajoints.trace_measure.png) | Scientia Trace | Clicks place the points of an open polyline; the measurement is stored as `TRACE`. Two points minimum. |
+
+The polygon and the trace share their controls. `RMB`, `Enter` or `Space`
+finishes the measurement. `Backspace`, `X` or `Del` removes the last point.
+`Esc` cancels. The polygon also closes on a click on its first point. The trace
+does not close.
+
+In all three tools `Ctrl` toggles snapping to visible geometry. The default
+snapping state is set in the tool header.
+
+## Measurement sources
+
+The add-on reads measurements from two sources: its own tools, which store
+measurements in `.blend` scene properties, and the annotations of Blender's
+ruler from the `RulerData3D` layer. Measurements from both sources are processed
+the same way.
+
+Exact duplicates are merged. Measurements whose coordinates agree to three
+decimal places are both kept and reported in the diagnostics. For a model in
+metres that is one millimetre. Only the operator can tell an accidental copy
+from two fractures that are genuinely close.
 
 ## Installation
 
-Two archives are published for every version. They install the chart packages
-in different ways, so if one fails the other is the fallback.
+Two archives are published for every version. They install `matplotlib` and
+`mplstereonet` in different ways.
 
-### Extension build (recommended)
+### Extension
 
-`ScientiaJoints-<version>-extension.zip` carries `matplotlib` and
-`mplstereonet` as wheels inside the archive. Blender unpacks them itself: no
-pip run, no package index, no proxy, and a short installation path.
+`ScientiaJoints-<version>-extension.zip` carries the wheels inside the archive.
+Blender unpacks them itself, with no pip run, no package index and no network.
+The installation path is short.
 
-1. Download the extension ZIP. Do not install a GitHub `Source code` archive.
-2. Drag the ZIP into Blender, or use `Edit > Preferences > Get Extensions > Install from Disk`.
+1. Download the extension ZIP. A GitHub `Source code` archive is not an
+   installable package.
+2. Drag the ZIP into Blender, or use
+   `Edit > Preferences > Get Extensions > Install from Disk`.
 
-This is the build to use on a corporate network that blocks package indexes,
-and the one to try first whenever the stereonet does not appear.
-
-### Legacy add-on build
+### Legacy add-on
 
 `ScientiaJoints-<version>.zip` installs through
-`Edit > Preferences > Add-ons > Install from Disk`. Chart packages are
-installed by the add-on itself: first from the wheels bundled in the archive
-(no network needed), and only if that fails from PyPI.
+`Edit > Preferences > Add-ons > Install from Disk`. The add-on installs the
+chart packages itself: first from the bundled wheels, and from PyPI if that
+fails. The installation runs on a worker thread and does not block Blender.
+Progress and the result appear in the add-on panel. A failed automatic attempt
+is repeated no more than once a day. The `SCIENTIAJOINTS_NO_AUTO_INSTALL`
+environment variable disables the automatic attempt.
 
-The installation runs in the background, so Blender never freezes while
-waiting for it. Progress and the result are shown in the ScientiaJoints panel.
-A failed automatic attempt is retried at most once a day; the
-`Install Chart Packages` button in the panel retries immediately. Set the
-`SCIENTIAJOINTS_NO_AUTO_INSTALL` environment variable to disable the automatic
-attempt entirely.
+The archive always contains `ScientiaJoints/__init__.py`. Blender requires that
+directory name, and it does not depend on the name of the ZIP itself. An archive
+whose root directory is named differently cannot be installed.
 
-The release ZIP always contains `ScientiaJoints/__init__.py`. This internal directory name is required by Blender and remains valid even if the ZIP file itself is renamed. A ZIP whose root directory is named `ScientiaJoints 3`, `ScientiaJoints-main`, or another variation is not an installable release package.
+The minimum Blender version is 5.0.0. `mplstereonet` 0.6.3 or newer is required.
+0.6.2 and earlier use `np.float`, removed in numpy 1.24, which stops the density
+contours on the stereonet from being drawn.
 
-### If charts do not appear
+### If the charts do not appear
 
-Open the diagnostics report with the small `i` icon in the ScientiaJoints panel
-header. It names the exact cause and the action to take, and can be copied to
-the clipboard for a support request. The most common causes are:
+The `i` icon in the panel header opens the diagnostics report. The report names
+the cause and the action. The observed causes:
 
-- **The packages were never installed.** The panel shows which ones are
-  missing and offers the install button.
-- **The Windows 260 character path limit.** `matplotlib` reads data files at
-  import time; past that limit the files exist but cannot be opened, and the
+- the packages are not installed; the panel shows which are missing and offers
+  the install button;
+- the 260 character path limit on Windows. `matplotlib` reads its data files at
+  import time. Past that limit the files exist but cannot be opened, and the
   import fails with `FileNotFoundError`. The report shows how many characters
-  each install directory has left. The extension build keeps the path short.
-- **A second `numpy`.** Blender ships `numpy`; another copy installed next to
-  it causes binary incompatibility errors in `matplotlib`. Neither build ships
-  `numpy` into Blender's own interpreter, and pip installs pin it to the
-  bundled version.
-- **A network that blocks or inspects HTTPS.** The report distinguishes a
-  certificate failure, a proxy rejection, a timeout, and an unreachable index.
-  Use the extension build in that case.
+  each install directory has left;
+- a second copy of numpy beside the one Blender ships causes binary
+  incompatibility errors in `matplotlib`;
+- a network that blocks or inspects HTTPS. The report distinguishes a certificate
+  failure, a proxy rejection, a timeout and an unreachable index.
 
-If an earlier installation failed, or an update reports a missing name from `ScientiaJoints.operators`, perform a clean installation:
+The first three causes do not apply to the extension archive. The packages are
+inside it, the installation path is short, and numpy is not installed into
+Blender's interpreter.
 
-1. Close every Blender window. Updating an enabled add-on in the same Blender process can leave old Python submodules in memory.
-2. Remove both folders if they exist:
+## Workflow
 
-   ```text
-   %APPDATA%\Blender Foundation\Blender\5.1\scripts\addons\ScientiaJoints
-   %APPDATA%\Blender Foundation\Blender\5.1\scripts\addons\ScientiaJoints 3
-   ```
+1. Load the outcrop model.
+2. Mark the fractures with the toolbar tools.
+3. Assign codes to the measurements in `Measurement Info`. A code gets a colour
+   and a visibility toggle, which allows one fracture set to be displayed at a
+   time.
+4. Enter the azimuth correction in `Azimuth Correction` if the model is rotated
+   relative to true north. `Real` is the true azimuth of a reference direction,
+   `Model` is the azimuth of the same reference in the model.
+5. Open the charts with the buttons at the top of the panel: a histogram of edge
+   lengths, a stereonet of pole density, a histogram of trace lengths. Each
+   button has an auto-update toggle next to it. One runs at a time.
+6. Export the result in `Export`. The CSV holds the computed quantities, the TXT
+   the source coordinates. The `.blend` file has to be saved: the export path is
+   built relative to it.
 
-3. Start Blender and install the prepared release ZIP.
+Trace lengths go to a separate histogram. A trace length is the sum of the
+segment lengths, an edge length is the distance between two points. These are
+different quantities, and one distribution does not describe both.
 
-Do not unpack the release ZIP and do not rename folders inside it.
+### Model display
 
-For manual installation, copy this repository directory as:
+`Chart Appearance > Blender View > Rock Inspection` puts every 3D view into
+Rendered shading and sets the lighting: a directional source at 22 degrees
+elevation, 0.5 degrees angular size and zero specular contribution, a matte
+material, and background strength 1.5. The directional source produces shadows
+in fractures and steps; the background sets the overall surface brightness.
 
-```text
-<Blender user scripts>/addons/ScientiaJoints/__init__.py
-```
+Pressing it again restores the shading, background, material, camera, colour
+management and render settings, and removes the source it added.
 
-### Building a Release
+Note. The material parameters are applied to the material named `material0`. The
+materials of the scene objects are not changed.
 
-Requirements:
+## Performance
 
-- Python 3.10 or newer. Blender is not required for packaging.
-- A complete repository checkout, not an individual `__init__.py`.
+Measured on a synthetic scene with the GPU and `blf` calls stubbed out, best of
+five redraws:
 
-Build procedure:
+| Measurements | Redraw time | Draw calls |
+|---|---|---|
+| 500 | 18 ms | 9 |
+| 2000 | 23 ms | 9 |
+| 10000 | 31 ms | 9 |
 
-1. Set the version. There is one command for it, and it is the only supported
-   way to change the number:
+Before the optimisation 500 measurements took 163 ms in 5452 draw calls, and
+2000 took 644 ms in 21823 draw calls. A scene of 10000 measurements did not
+complete inside the two minute test limit.
+
+The geometry of the three-dimensional pass is built in world space and cached.
+Orbiting and panning do not recompute it. The screen-space elements, the point
+handles and the labels, are rebuilt every frame. Their count is capped by
+`Overlay Style > Viewport Budget`: 2000 handles and 200 labels by default. The
+ones nearest the middle of the view are drawn, along with the active measurement
+and the one under the cursor.
+
+## Building a release
+
+Python 3.10 or newer and a complete repository checkout are required. Blender is
+needed only to validate the built archive.
+
+1. Set the version:
 
    ```powershell
-   python tools\version.py 3.4.0
+   python tools\version.py 3.4.2
    ```
 
-   The version lives in `blender_manifest.toml`. Blender reads `bl_info` out of
-   `__init__.py` with `ast.literal_eval` before the add-on is ever imported, so
-   that copy cannot be computed; the command writes both files, and
-   `tools\build_release.py` refuses to package a checkout where they disagree.
-   Run `python tools\version.py` with no argument to print the current version.
-2. Add release notes to `CHANGELOG.md`.
-3. Download the wheels that will be bundled. Run this with the **Blender**
-   Python so the wheel tags match the Blender the release targets:
+   The version is stored in `blender_manifest.toml`. Blender reads `bl_info`
+   from `__init__.py` with `ast.literal_eval` before the add-on is imported, so
+   that copy cannot be computed. The command writes both files.
+   `tools\build_release.py` refuses to package a checkout whose values have
+   diverged. With no argument the command prints the current version.
+
+2. Add an entry to `CHANGELOG.md`.
+
+3. Download the wheels. Run this with the Blender interpreter so the tags match
+   the target version:
 
    ```powershell
    & 'E:\SteamLibrary\steamapps\common\Blender\5.2\python\bin\python.exe' tools\fetch_wheels.py --platform win_amd64 --python-version 3.13
    ```
 
-   Add `--all-platforms` to produce an archive that installs on Windows, Linux
-   and macOS. `wheels/` is not committed; it is rebuilt per release.
+   `--all-platforms` collects the set for Windows, Linux and macOS. The `wheels/`
+   directory is not committed and is rebuilt for each release.
 
-4. From the repository root, run the tests and compile checks:
+4. Run the tests from the repository root:
 
    ```powershell
    python -m unittest discover -s tests -v
-   python -m py_compile __init__.py dependencies.py diagnostics.py parser.py operators.py panel.py visualization.py scene_measurements.py custom_measure_tool.py domain\__init__.py domain\measurements.py domain\geometry.py application\__init__.py application\services.py infrastructure\__init__.py infrastructure\blender_annotations.py infrastructure\blender_scene_measurements.py infrastructure\exporters.py tools\build_release.py tools\build_tool_icons.py tools\fetch_wheels.py tools\version.py
    ```
 
-5. Build both archives:
+5. Build the archives:
 
    ```powershell
    python tools\build_release.py
    ```
 
-   This writes `dist/ScientiaJoints-<version>.zip` (legacy) and
-   `dist/ScientiaJoints-<version>-extension.zip`, validates the package
-   structure, Python syntax, required module API, and the manifest/wheel
-   consistency, and prints SHA-256 checksums. Use `--format legacy` or
-   `--format extension` to build only one.
+   The command writes `dist/ScientiaJoints-<version>.zip` and
+   `dist/ScientiaJoints-<version>-extension.zip`, checks the package structure,
+   the Python syntax, the presence of the required symbols in the modules and
+   the agreement between the manifest and the bundled wheels, and prints
+   SHA-256. `--format legacy` and `--format extension` build one archive.
 
-6. Let Blender validate the extension archive:
+6. Validate the extension archive with Blender:
 
    ```powershell
    & 'E:\SteamLibrary\steamapps\common\Blender\blender.exe' --command extension validate "dist\ScientiaJoints-$(python tools\version.py)-extension.zip"
    ```
 
-7. Install both archives in a clean Blender profile before publishing. Point
-   `BLENDER_USER_RESOURCES` at an empty directory with a **short** path to get
-   an isolated profile.
+7. Install both archives into a clean profile. `BLENDER_USER_RESOURCES` has to
+   point at an empty directory with a short path.
 
-The legacy archive keeps the `numpy` wheel, because `pip --target` resolves
-dependencies without looking at what is already installed and would otherwise
-fail offline. The extension archive drops it, because Blender ships `numpy`
-and a second copy risks a binary incompatibility.
+The legacy archive contains the numpy wheel. `pip --target` resolves
+dependencies without regard to the packages already installed, and without that
+wheel an offline installation fails. The extension archive does not contain
+numpy: Blender ships its own, and a second copy causes binary incompatibility
+errors.
 
-### Toolbar Icons
+### Artwork
 
-The two workspace tools draw their own toolbar icons from `icons/*.dat`.
-Blender's toolbar does not take images: an icon is a list of flat-shaded
-triangles on a 255×255 canvas, and `WorkSpaceTool.bl_icon` names the file to
-load. The artwork is therefore described as vector shapes in
-`tools/build_tool_icons.py` and rendered to triangles by it:
+Blender loads the tool icons from `icons/*.dat`. The format holds a list of
+triangles on a 255×255 canvas rather than a raster image. The artwork is defined
+as vectors in `tools/build_tool_icons.py`:
 
 ```powershell
 python tools\build_tool_icons.py --preview preview.png
-```
-
-The `.dat` files are committed, so a normal build needs nothing; re-run the
-script after changing the drawing code. `tests/test_tool_icons.py` fails if the
-committed files no longer match it, if the format is corrupt, or if a tool
-quietly fell back to the built-in ruler icon.
-
-To reuse the artwork outside Blender - in a slide, a document, a README - export
-it as PNG with a transparent background:
-
-```powershell
 python tools\build_tool_icons.py --png --png-size 1024
+python tools\build_logo.py --size 512
 ```
 
-The files land in `icons/png/` and are not committed: they are regenerated from
-the same source in one command, and a committed copy would only go stale.
+The `.dat` files are committed and a normal build does not regenerate them. The
+script has to be run after a change to the drawing code. `--png` writes PNGs
+with a transparent background, and `tools/build_logo.py` writes the add-on logo.
+`tests/test_tool_icons.py` checks that the committed `.dat` files match the
+generator output, that the format is valid, and that the tools do not use
+Blender's built-in ruler icon instead of their own.
 
-### Reading rock structure in the viewport
-
-`Chart Appearance > Blender View > Rock Inspection` switches every 3D view to
-Rendered shading and lights the model for reading structure: a sun grazing the
-surface at a low angle so fractures and steps fall into shadow, near-parallel
-rays so a hairline fracture still casts one, no specular contribution so no
-highlight sits over the texture, matte materials, and low ambient light so the
-contrast survives. Press it again to restore the shading, world, material,
-camera and render settings and to delete the light it added.
-
-## Basic Workflow
-
-1. Create measurements with Blender Measure/Ruler, `Scientia Measure`, or `Scientia Polygon Plane`.
-2. Use `Measurement Info` to inspect the selected measurement and assign an existing or new code.
-3. Use `Measurement Display` to set label fields, snap mode, code group colors, and visibility.
-   `Overlay Style` inside it controls the line width, the label text size and
-   whether a label sits at the centre of its measurement's area, whether point
-   handles are drawn and how large they are, and the translucent fill on plane
-   and polygon measurements together with its opacity. `Viewport Budget` at the
-   bottom caps how many point handles and labels a redraw draws: on a scene with
-   thousands of measurements those are what cost frame time, and the ones kept
-   are the ones nearest the middle of the view. Raise them to see more at once,
-   lower them if the viewport lags.
-4. Use `Histogram` or `Stereonet` buttons at the top of the sidebar panel.
-5. Use `Export` to write raw TXT or processed CSV files next to the saved `.blend` file.
-
-Visibility switches (per code group, per layer, and the linear/plane toggles)
-only affect the viewport. Every measurement is processed and exported
-regardless of what is currently hidden.
-
-### Notes on plane orientation
-
-- Dip is the angle of the plane from horizontal; azimuth is the compass bearing
-  of the steepest descent, clockwise from `+Y`. Both are verified against a
-  NumPy reference to better than `1e-12` degrees.
-- For a **vertical** plane the dip direction is ambiguous by 180 degrees, which
-  is a property of the measurement, not of the add-on. Above about 89 degrees
-  of dip, two traces of the same fracture can report azimuths 180 degrees
-  apart. Take that into account when clustering sub-vertical joint sets. Below
-  89 degrees the result is fully stable.
-- A polygon whose points lie on one straight line, or coincide, cannot define
-  an orientation. Such measurements are marked `Orientation is arbitrary` in
-  `Measurement Info`, counted in Statistics, listed by name in the diagnostics
-  report, and carry a reason in the `degeneracy` column of the faces CSV.
-
-## Development Checks
-
-Run from the add-on folder:
+## Development checks
 
 ```powershell
 python -m unittest discover -s tests -v
-python -m py_compile __init__.py dependencies.py parser.py operators.py panel.py visualization.py scene_measurements.py custom_measure_tool.py domain\__init__.py domain\measurements.py domain\geometry.py application\__init__.py application\services.py infrastructure\__init__.py infrastructure\blender_annotations.py infrastructure\blender_scene_measurements.py infrastructure\exporters.py tools\build_release.py tools\build_tool_icons.py tools\version.py
 ```
 
-Optional Blender smoke test:
+Registration check in Blender:
 
 ```powershell
-& 'E:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-expr "import sys; sys.path.insert(0, r'C:\Users\Wismut\AppData\Roaming\Blender Foundation\Blender\5.1\scripts\addons'); import addon_utils, bpy; addon_utils.enable('ScientiaJoints', default_set=False, persistent=False); assert hasattr(bpy.ops.export, 'raw_edges'); addon_utils.disable('ScientiaJoints', default_set=False); print('SCIENTIAJOINTS_SMOKE_OK')"
+& 'E:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-expr "import addon_utils, bpy; addon_utils.enable('ScientiaJoints', default_set=False, persistent=False); assert hasattr(bpy.ops.export, 'raw_edges'); print('SMOKE_OK')"
 ```
 
-## Changelog
+## Documents
 
-See [CHANGELOG.md](CHANGELOG.md) for changes since the original 2.2 baseline.
+- [CHANGELOG.md](CHANGELOG.md) — changes by version.
+- [docs/llm-agent/](docs/llm-agent/) — architecture, defect analysis, and a
+  description of the measurement processing pipeline.
+- [README.ru.md](README.ru.md) — Russian version.
 
-## Publication Note
+## License
 
-Choose and add a license before publishing the repository publicly.
+`blender_manifest.toml` declares GPL-3.0-or-later. There is no `LICENSE` file in
+the repository.
+
+The Blender Foundation's position is that an add-on using the Blender Python API
+is a derivative work of Blender and requires a GPL-compatible license. The
+extensions.blender.org platform accepts only such licenses for code. A license
+that forbids modification is not compatible with the GPL.
