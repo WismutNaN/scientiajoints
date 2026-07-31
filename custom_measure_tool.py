@@ -386,17 +386,25 @@ class ScientiaMeasureDragOperator(Operator):
         _active_preview["points"] = tuple(points)
 
 
-class ScientiaPolygonMeasureOperator(Operator):
-    bl_idname = "wm.scientia_polygon_measure"
-    bl_label = "Scientia Polygon Plane"
-    bl_description = "Create a closed multi-point polygon plane measurement"
-    bl_options = {'UNDO'}
+class _MultiPointMeasure:
+    """Click-by-click point placing, shared by the polygon and trace tools.
+
+    Deliberately not an ``Operator`` subclass, and never registered. Blender
+    binds an RNA struct to its Python class through attributes a subclass
+    inherits, so registering an operator *and* a subclass of that operator
+    leaves the parent's struct without a usable class. Blender then logs
+    ``unable to get Python class for RNA struct 'WM_OT_scientia_polygon_measure'``
+    and the parent tool answers its key-map with nothing to run: it is in the
+    toolbar, it can be selected, and clicking does nothing at all. Sharing the
+    behaviour through a plain mixin keeps the two operators independent as far
+    as registration is concerned.
+    """
 
     #: What the finished measurement is stored as.
     measurement_kind = "POLYLINE"
     editable_kinds = frozenset({"PLANE", "POLYLINE"})
-    #: Whether the outline closes back to its first point. The trace tool below
-    #: is the same interaction with this off, so the two share everything.
+    #: Whether the outline closes back to its first point. The trace tool is the
+    #: same interaction with this off, so the two share everything else.
     closes = True
     minimum_points = 3
     too_few_points_message = "At least three polygon points are required."
@@ -598,7 +606,14 @@ class ScientiaPolygonMeasureOperator(Operator):
         return {'FINISHED'}
 
 
-class ScientiaTraceMeasureOperator(ScientiaPolygonMeasureOperator):
+class ScientiaPolygonMeasureOperator(_MultiPointMeasure, Operator):
+    bl_idname = "wm.scientia_polygon_measure"
+    bl_label = "Scientia Polygon Plane"
+    bl_description = "Create a closed multi-point polygon plane measurement"
+    bl_options = {'UNDO'}
+
+
+class ScientiaTraceMeasureOperator(_MultiPointMeasure, Operator):
     bl_idname = "wm.scientia_trace_measure"
     bl_label = "Scientia Trace"
     bl_description = "Create an open multi-point trace measured by the total length of its segments"
@@ -717,26 +732,6 @@ def _drop_stray_separators(tools):
             del tools[index]
 
 
-def _remove_tool_keymap(tool_def):
-    """Remove the key-map ``register_tool`` created for a tool definition.
-
-    After registration ``ToolDef.keymap`` is a one-item list holding the
-    generated key-map name, which is what Blender's own ``unregister_tool``
-    looks up. Before registration it still holds the callback, so anything
-    that is not a string is left alone.
-    """
-    keymap = getattr(tool_def, "keymap", None)
-    if not keymap or not isinstance(keymap[0], str):
-        return
-    keyconfigs = bpy.context.window_manager.keyconfigs
-    for keyconfig in (keyconfigs.default, keyconfigs.addon):
-        if keyconfig is None:
-            continue
-        existing = keyconfig.keymaps.get(keymap[0])
-        if existing is not None:
-            keyconfig.keymaps.remove(existing)
-
-
 def purge_registered_tools(idnames=TOOL_IDNAMES):
     """Remove toolbar entries for ``idnames``, whoever registered them.
 
@@ -748,6 +743,17 @@ def purge_registered_tools(idnames=TOOL_IDNAMES):
     Blender then refuses the fresh registration with
     ``Tool 'scientiajoints.measure' already exists!`` and the add-on fails to
     enable at all.
+
+    Only the toolbar entry is removed, never the key-map. Blender names a tool
+    key-map after the tool's label, so two installed copies of the add-on
+    produce the same name. Deleting it here removed the key-map a live
+    registration of the other copy was still using, which left that tool in the
+    toolbar with nothing bound to it: selecting it and clicking did nothing at
+    all. A leftover key-map costs nothing by comparison, because
+    ``register_tool`` reuses one of the same name and Blender ignores items
+    whose operator is missing. The normal path still cleans up, in
+    ``bpy.utils.unregister_tool``, which removes the key-map of the entry it
+    owns.
 
     Returns the identifiers that were actually removed.
     """
@@ -762,7 +768,6 @@ def purge_registered_tools(idnames=TOOL_IDNAMES):
         if getattr(entry, "idname", None) not in idnames:
             return True
         removed.append(entry.idname)
-        _remove_tool_keymap(entry)
         return False
 
     for tools in _toolbar_tool_lists():

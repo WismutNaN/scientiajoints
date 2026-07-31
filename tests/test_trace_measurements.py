@@ -248,13 +248,31 @@ class TraceOverlayTests(unittest.TestCase):
         self.assertFalse(self.tool._measurement_kind_visible(scene, _Measurement("POLYLINE")))
         self.assertTrue(self.tool._measurement_kind_visible(scene, _Measurement("TRACE")))
 
+    def test_neither_tool_is_a_subclass_of_the_other(self):
+        """Blender binds an RNA struct to its Python class through attributes a
+        subclass inherits. Registering an operator and a subclass of it left the
+        parent's struct without a usable class, and the parent tool answered its
+        key-map with nothing to run. The shared behaviour lives in a mixin that
+        is never registered."""
+        polygon = self.tool.ScientiaPolygonMeasureOperator
+        trace = self.tool.ScientiaTraceMeasureOperator
+
+        self.assertFalse(issubclass(trace, polygon))
+        self.assertFalse(issubclass(polygon, trace))
+        for operator in (polygon, trace):
+            self.assertTrue(issubclass(operator, self.tool._MultiPointMeasure))
+        self.assertNotIn(
+            self.tool._MultiPointMeasure,
+            self.tool._WORKSPACE_TOOLS,
+            "the mixin must never be registered",
+        )
+
     def test_the_trace_tool_is_the_polygon_tool_without_closing(self):
         """The two share every bit of interaction, so the differences are worth
         pinning down."""
         polygon = self.tool.ScientiaPolygonMeasureOperator
         trace = self.tool.ScientiaTraceMeasureOperator
 
-        self.assertTrue(issubclass(trace, polygon))
         self.assertTrue(polygon.closes)
         self.assertFalse(trace.closes)
         self.assertEqual(polygon.measurement_kind, "POLYLINE")

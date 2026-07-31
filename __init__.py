@@ -4,7 +4,7 @@
 bl_info = {
     "name": "ScientiaJoints",
     "author": "Scientia, Ivan Guzeev",
-    "version": (3, 4, 8),
+    "version": (3, 4, 9),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > ScientiaJoints",
     "description": "Export measurements with visualizations and adjustable settings",
@@ -171,6 +171,52 @@ def _delete_scene_properties(names):
                 logger.info("Scene property removed: %s", name)
         except Exception as e:
             logger.debug("Failed to remove Scene property %s: %s", name, e)
+
+
+def _rna_identifier(cls):
+    """The name Blender files a class under in ``bpy.types``.
+
+    An operator's is built from its ``bl_idname``: ``wm.scientia_polygon_measure``
+    becomes ``WM_OT_scientia_polygon_measure``. Panels and menus already use the
+    RNA name as their ``bl_idname``, and everything else uses the class name.
+    """
+    bl_idname = getattr(cls, "bl_idname", "")
+    if not bl_idname:
+        return cls.__name__
+    if "." in bl_idname:
+        prefix, _, name = bl_idname.partition(".")
+        return f"{prefix.upper()}_OT_{name}"
+    return bl_idname
+
+
+def _drop_stale_registration(cls):
+    """Remove a registration Blender still holds under this class's RNA name.
+
+    Updating the add-on inside a running Blender gives every class a fresh
+    Python object while Blender keeps the RNA struct made by the previous one,
+    and re-running this file resets the ``classes`` record that ``unregister``
+    would have used to clean up. What is left is a struct with no Python class
+    behind it: the console reports ``unable to get Python class for RNA struct
+    'WM_OT_scientia_polygon_measure'``, the tool's key-map still fires, and
+    nothing happens because there is nothing to run.
+
+    Looking the registration up by RNA identifier rather than by class identity
+    is what finds one whose Python class is already gone.
+    """
+    identifier = _rna_identifier(cls)
+    existing = getattr(bpy.types, identifier, None)
+    if existing is None or existing is cls:
+        return
+    try:
+        bpy.utils.unregister_class(existing)
+        logger.info("Dropped a stale registration of %s left by an earlier load.", identifier)
+    except Exception as e:
+        logger.debug("Could not drop the stale registration of %s: %s", identifier, e)
+
+
+def _register_class(cls):
+    _drop_stale_registration(cls)
+    bpy.utils.register_class(cls)
 
 
 def _safe_unregister_class(cls):
@@ -414,9 +460,9 @@ def register():
     try:
         _startup_diagnostics_generation += 1
 
-        bpy.utils.register_class(LightSettings)
+        _register_class(LightSettings)
         for cls in scene_measurement_property_classes():
-            bpy.utils.register_class(cls)
+            _register_class(cls)
         bpy.types.Scene.my_light_settings = PointerProperty(type=LightSettings)
         define_scene_measurement_properties()
 
@@ -610,7 +656,7 @@ def register():
         )
 
         for cls in class_candidates:
-            bpy.utils.register_class(cls)
+            _register_class(cls)
             registered_classes.append(cls)
             logger.info("Registered class: %s", cls.__name__)
 

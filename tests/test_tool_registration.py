@@ -110,17 +110,24 @@ class PurgeRegisteredToolsTests(unittest.TestCase):
         self.assertEqual(removed, ())
         self.assertEqual(len(tools), 3)
 
-    def test_the_key_map_of_a_removed_entry_goes_with_it(self):
-        """A left-behind key-map keeps answering the tool's shortcuts."""
+    def test_the_key_map_of_a_removed_entry_is_left_alone(self):
+        """Blender names a tool key-map after the tool's label, so two installed
+        copies of the add-on share the name. Deleting it here took away the
+        key-map a live registration of the other copy was using, and left that
+        tool in the toolbar with nothing bound to it."""
         keymap_name = "3D View Tool: Object, Scientia Measure"
         self.keyconfig.keymaps.maps[keymap_name] = types.SimpleNamespace(name=keymap_name)
         _install_toolsystem_stub([_ToolDef("scientiajoints.measure", keymap=[keymap_name])])
 
-        self.module.purge_registered_tools()
+        removed = self.module.purge_registered_tools()
 
-        self.assertIsNone(self.keyconfig.keymaps.get(keymap_name))
+        self.assertEqual(removed, ("scientiajoints.measure",), "the toolbar entry still goes")
+        self.assertIsNotNone(
+            self.keyconfig.keymaps.get(keymap_name),
+            "the key-map may still belong to another live registration",
+        )
 
-    def test_an_unregistered_entry_keeps_its_callback_key_map(self):
+    def test_an_unregistered_entry_is_removed_too(self):
         """Before registration ``keymap`` still holds the callback, not a name."""
         _install_toolsystem_stub([_ToolDef("scientiajoints.measure", keymap=[lambda km: None])])
 
